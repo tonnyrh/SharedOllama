@@ -1,7 +1,9 @@
 import asyncio
 import json
+import logging
 import os
 import time
+from contextlib import asynccontextmanager
 from typing import Any
 
 import aiosqlite
@@ -12,8 +14,9 @@ from fastapi.responses import Response
 OLLAMA_INTERNAL_URL = os.getenv("OLLAMA_INTERNAL_URL", "http://ollama:11434").rstrip("/")
 DB_PATH = os.getenv("MONITOR_DB_PATH", "/data/monitor.db")
 RETENTION_DAYS = int(os.getenv("MONITOR_RETENTION_DAYS", "30"))
+ERROR_TEXT_LIMIT = 2000
 
-app = FastAPI(title="SharedOllama Monitor Proxy")
+logger = logging.getLogger("monitor_proxy")
 http_client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0))
 retention_task: asyncio.Task | None = None
 
@@ -58,8 +61,8 @@ async def retention_loop() -> None:
     while True:
         try:
             await cleanup_old_records()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.exception("Retention cleanup failed: %s", exc)
         await asyncio.sleep(3600)
 
 
@@ -220,19 +223,21 @@ async def _insert_log(entry: dict[str, Any]) -> None:
         await db.commit()
 
 
-@app.on_event("startup")
-async def startup() -> None:
+@asynccontextmanager
+async def lifespan(_: FastAPI):
     global retention_task
     await init_db()
     await cleanup_old_records()
     retention_task = asyncio.create_task(retention_loop())
+    try:
+        yield
+    finally:
+        if retention_task:
+            retention_task.cancel()
+        await http_client.aclose()
 
 
-@app.on_event("shutdown")
-async def shutdown() -> None:
-    if retention_task:
-        retention_task.cancel()
-    await http_client.aclose()
+app = FastAPI(title="SharedOllama Monitor Proxy", lifespan=lifespan)
 
 
 @app.get("/monitor/summary")
@@ -355,7 +360,7 @@ async def proxy(full_path: str, request: Request) -> Response:
                 "completion_tokens": completion_tokens,
                 "response_time_ms": response_time_ms,
                 "status_code": upstream_response.status_code,
-                "error": None if upstream_response.status_code < 400 else upstream_response.text[:2000],
+                "error": None if upstream_response.status_code < 400 else upstream_response.text[:ERROR_TEXT_LIMIT],
                 "prompt": prompt,
                 "answer": answer,
             }
@@ -388,7 +393,7 @@ async def proxy(full_path: str, request: Request) -> Response:
                 "completion_tokens": None,
                 "response_time_ms": response_time_ms,
                 "status_code": 502,
-                "error": str(exc)[:2000],
+                "error": str(exc)[:ERROR_TEXT_LIMIT],
                 "prompt": prompt,
                 "answer": None,
             }
