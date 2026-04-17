@@ -163,6 +163,19 @@ def _extract_response_fields(
     return answer, prompt_tokens, completion_tokens, model
 
 
+def _extract_error_message(response_bytes: bytes, content_type: str, status_code: int) -> str | None:
+    if status_code < 400:
+        return None
+    if "application/json" in content_type:
+        response_json = _safe_json_loads(response_bytes)
+        if isinstance(response_json, dict):
+            for key in ("error", "detail", "message"):
+                value = response_json.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value[:ERROR_TEXT_LIMIT]
+    return f"Upstream HTTP {status_code}"
+
+
 async def _extract_memory_used_bytes(model: str | None) -> int | None:
     if not model:
         return None
@@ -360,7 +373,9 @@ async def proxy(full_path: str, request: Request) -> Response:
                 "completion_tokens": completion_tokens,
                 "response_time_ms": response_time_ms,
                 "status_code": upstream_response.status_code,
-                "error": None if upstream_response.status_code < 400 else upstream_response.text[:ERROR_TEXT_LIMIT],
+                "error": _extract_error_message(
+                    response_bytes, content_type, upstream_response.status_code
+                ),
                 "prompt": prompt,
                 "answer": answer,
             }
