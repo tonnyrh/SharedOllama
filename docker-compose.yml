@@ -2,8 +2,6 @@ services:
   ollama:
     image: ollama/ollama:latest
     container_name: shared-ollama
-    ports:
-      - "${OLLAMA_BIND_ADDRESS:-0.0.0.0}:${OLLAMA_PUBLISHED_PORT:-11435}:11434"
     volumes:
       - ollama_data:/root/.ollama
     restart: unless-stopped
@@ -13,6 +11,21 @@ services:
       timeout: 10s
       retries: 5
       start_period: 20s
+  monitor:
+    build:
+      context: ./monitor
+    container_name: shared-ollama-monitor
+    depends_on:
+      - ollama
+    environment:
+      OLLAMA_BACKEND_URL: http://ollama:11434
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
+      MAX_QUEUE_SIZE: ${MAX_QUEUE_SIZE:-200}
+      QUEUE_WORKERS: ${QUEUE_WORKERS:-2}
+      ALERT_QUEUE_THRESHOLD: ${ALERT_QUEUE_THRESHOLD:-50}
+    ports:
+      - "${OLLAMA_BIND_ADDRESS:-0.0.0.0}:${OLLAMA_PUBLISHED_PORT:-11435}:8080"
+    restart: unless-stopped
 
 volumes:
   ollama_data:
