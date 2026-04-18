@@ -4,6 +4,7 @@ import os
 import time
 import uuid
 from collections import deque
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -11,6 +12,8 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
+
+MAX_BODY_PREVIEW_LENGTH = 200
 
 
 def now_iso() -> str:
@@ -36,6 +39,8 @@ class MonitorState:
         self.max_error_entries = int(os.getenv("MAX_ERROR_ENTRIES", "200"))
         self.max_alert_entries = int(os.getenv("MAX_ALERT_ENTRIES", "200"))
         self.alert_queue_threshold = int(os.getenv("ALERT_QUEUE_THRESHOLD", "50"))
+        self.upstream_timeout = float(os.getenv("UPSTREAM_TIMEOUT_SECONDS", "300"))
+        self.monitor_token = os.getenv("MONITOR_TOKEN", "")
 
         self.started_at = time.time()
         self.requests_total = 0
@@ -112,7 +117,7 @@ class MonitorState:
 
             started = time.time()
             try:
-                async with httpx.AsyncClient(timeout=None) as client:
+                async with httpx.AsyncClient(timeout=self.upstream_timeout) as client:
                     resp = await client.request(
                         method=item["method"],
                         url=f'{self.backend_url}{item["path"]}',
@@ -144,15 +149,18 @@ class MonitorState:
 
 
 state = MonitorState()
-app = FastAPI(title="SharedOllama Monitor")
 
 
-@app.on_event("startup")
-async def startup() -> None:
+@asynccontextmanager
+async def lifespan(_: FastAPI):
     for _ in range(state.workers):
         asyncio.create_task(state.process_queue())
     asyncio.create_task(model_refresher())
     await state.add_log("INFO", "Monitor started", backend_url=state.backend_url, workers=state.workers)
+    yield
+
+
+app = FastAPI(title="SharedOllama Monitor", lifespan=lifespan)
 
 
 async def model_refresher() -> None:
@@ -167,7 +175,10 @@ async def health() -> dict[str, Any]:
 
 
 @app.get("/monitor", response_class=HTMLResponse)
-async def monitor_page() -> str:
+async def monitor_page(request: Request) -> str | JSONResponse:
+    auth_error = await ensure_monitor_auth(request)
+    if auth_error:
+        return auth_error
     return """
 <!doctype html>
 <html>
@@ -179,7 +190,7 @@ async def monitor_page() -> str:
       .grid { display: grid; grid-template-columns: repeat(3, minmax(220px, 1fr)); gap: 12px; }
       .card { background: #fff; border-radius: 8px; padding: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
       h1,h2 { margin: 0 0 10px; }
-      pre { max-height: 240px; overflow: auto; background: #121417; color: #d5f8df; padding: 10px; border-radius: 6px; }
+      pre { max-height: 240px; overflow: auto; background: #121417; color: #ffffff; padding: 10px; border-radius: 6px; }
       table { width: 100%; border-collapse: collapse; background:#fff; border-radius:8px; overflow:hidden; }
       th, td { text-align: left; border-bottom: 1px solid #eee; padding: 6px; font-size: 12px; }
       .section { margin-top: 16px; }
@@ -195,7 +206,8 @@ async def monitor_page() -> str:
     <div class="section">
       <h2>Queued Requests</h2>
       <table>
-        <thead><tr><th>ID</th><th>Method</th><th>Path</th><th>Queued At (unix)</th><th>Body Preview</th></tr></thead>
+        <caption style="text-align:left; padding:6px; font-size:12px;">Queued write requests waiting for Ollama processing, including request metadata and redacted preview payloads.</caption>
+        <thead><tr><th>ID</th><th>Method</th><th>Path</th><th>Queued At (Unix)</th><th>Body Preview</th></tr></thead>
         <tbody id="queue"></tbody>
       </table>
     </div>
@@ -212,12 +224,42 @@ async def monitor_page() -> str:
       <pre id="logs"></pre>
     </div>
     <script>
+      function renderStats(stats) {
+        const statsEl = document.getElementById('stats');
+        statsEl.innerHTML = '';
+        Object.entries(stats).forEach(([k, v]) => {
+          const card = document.createElement('div');
+          card.className = 'card';
+          const label = document.createElement('b');
+          label.textContent = k;
+          const value = document.createElement('div');
+          value.textContent = String(v);
+          card.appendChild(label);
+          card.appendChild(value);
+          statsEl.appendChild(card);
+        });
+      }
+
+      function renderQueue(queue) {
+        const queueEl = document.getElementById('queue');
+        queueEl.innerHTML = '';
+        queue.forEach((q) => {
+          const tr = document.createElement('tr');
+          [q.request_id, q.method, q.path, q.enqueue_time, q.body_preview].forEach((value) => {
+            const td = document.createElement('td');
+            td.textContent = String(value ?? '');
+            tr.appendChild(td);
+          });
+          queueEl.appendChild(tr);
+        });
+      }
+
       async function refresh() {
-        const r = await fetch('/monitor/api/state');
+        const r = await fetch('/monitor/api/state' + window.location.search);
         const s = await r.json();
-        document.getElementById('stats').innerHTML = Object.entries(s.stats).map(([k,v]) => `<div class="card"><b>${k}</b><div>${v}</div></div>`).join('');
+        renderStats(s.stats);
         document.getElementById('models').textContent = JSON.stringify(s.models, null, 2);
-        document.getElementById('queue').innerHTML = s.queue.map(q => `<tr><td>${q.request_id}</td><td>${q.method}</td><td>${q.path}</td><td>${q.enqueue_time}</td><td>${q.body_preview}</td></tr>`).join('');
+        renderQueue(s.queue);
         document.getElementById('alerts').textContent = JSON.stringify(s.alerts, null, 2);
         document.getElementById('errors').textContent = JSON.stringify(s.errors, null, 2);
         document.getElementById('logs').textContent = JSON.stringify(s.logs, null, 2);
@@ -231,7 +273,10 @@ async def monitor_page() -> str:
 
 
 @app.get("/monitor/api/state")
-async def monitor_state() -> dict[str, Any]:
+async def monitor_state(request: Request) -> dict[str, Any] | JSONResponse:
+    auth_error = await ensure_monitor_auth(request=request)
+    if auth_error:
+        return auth_error
     queue_items = await state.queue_snapshot()
     async with state.lock:
         stats = {
@@ -259,15 +304,62 @@ async def monitor_state() -> dict[str, Any]:
 
 
 @app.get("/monitor/api/queue")
-async def queue_details() -> dict[str, Any]:
+async def queue_details(request: Request) -> dict[str, Any] | JSONResponse:
+    auth_error = await ensure_monitor_auth(request)
+    if auth_error:
+        return auth_error
     return {"queue": await state.queue_snapshot()}
 
 
 @app.get("/monitor/api/models")
-async def models() -> dict[str, Any]:
+async def models(request: Request) -> dict[str, Any] | JSONResponse:
+    auth_error = await ensure_monitor_auth(request)
+    if auth_error:
+        return auth_error
     await state.refresh_models()
     async with state.lock:
         return {"models": state.models_cache, "last_refresh": state.last_models_refresh}
+
+
+async def ensure_monitor_auth(request: Request | None) -> JSONResponse | None:
+    if not state.monitor_token:
+        return None
+    if request is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    token = request.headers.get("x-monitor-token") or request.query_params.get("token", "")
+    if token != state.monitor_token:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return None
+
+
+def redact_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for k, v in value.items():
+            lowered = k.lower()
+            if any(secret_key in lowered for secret_key in ("password", "token", "secret", "api_key", "authorization")):
+                redacted[k] = "***REDACTED***"
+            else:
+                redacted[k] = redact_json(v)
+        return redacted
+    if isinstance(value, list):
+        return [redact_json(i) for i in value]
+    return value
+
+
+def make_body_preview(body: bytes, content_type: str) -> str:
+    if not body:
+        return ""
+    if "application/json" in content_type.lower():
+        try:
+            parsed = json.loads(body.decode("utf-8", errors="ignore"))
+            redacted = redact_json(parsed)
+            text = json.dumps(redacted, ensure_ascii=False)
+            return text[:MAX_BODY_PREVIEW_LENGTH]
+        except Exception:
+            pass
+    text = body.decode("utf-8", errors="ignore").replace("\n", " ")
+    return text[:MAX_BODY_PREVIEW_LENGTH]
 
 
 @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
@@ -288,10 +380,10 @@ async def proxy(full_path: str, request: Request) -> Response:
         if k.lower() not in {"host", "content-length", "connection", "accept-encoding"}
     }
 
-    queue_heavy = request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"} and path.startswith("/api/")
-    if not queue_heavy:
+    should_queue_request = request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"} and path.startswith("/api/")
+    if not should_queue_request:
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
+            async with httpx.AsyncClient(timeout=state.upstream_timeout) as client:
                 backend_resp = await client.request(
                     request.method, f"{state.backend_url}{path}", content=body, headers=headers
                 )
@@ -309,7 +401,7 @@ async def proxy(full_path: str, request: Request) -> Response:
         return JSONResponse({"error": "queue full"}, status_code=429)
 
     request_id = str(uuid.uuid4())
-    preview = body[:200].decode("utf-8", errors="ignore").replace("\n", " ")
+    preview = make_body_preview(body, request.headers.get("content-type", ""))
     item_info = QueueItemInfo(
         request_id=request_id,
         method=request.method.upper(),

@@ -24,6 +24,12 @@ Open:
 http://localhost:11435/monitor
 ```
 
+If `MONITOR_TOKEN` is set, open with:
+
+```text
+http://localhost:11435/monitor?token=<MONITOR_TOKEN>
+```
+
 This page provides:
 
 - Loaded model visibility
@@ -66,6 +72,8 @@ RATE_LIMIT_PER_MINUTE=120
 MAX_QUEUE_SIZE=200
 QUEUE_WORKERS=2
 ALERT_QUEUE_THRESHOLD=50
+UPSTREAM_TIMEOUT_SECONDS=300
+MONITOR_TOKEN=
 ```
 
 ## Stop
