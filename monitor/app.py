@@ -175,7 +175,7 @@ async def health() -> dict[str, Any]:
 
 
 @app.get("/monitor", response_class=HTMLResponse)
-async def monitor_page(request: Request) -> str | JSONResponse:
+async def monitor_page(request: Request) -> Response:
     auth_error = await ensure_monitor_auth(request)
     if auth_error:
         return auth_error
@@ -273,7 +273,7 @@ async def monitor_page(request: Request) -> str | JSONResponse:
 
 
 @app.get("/monitor/api/state")
-async def monitor_state(request: Request) -> dict[str, Any] | JSONResponse:
+async def monitor_state(request: Request) -> Any:
     auth_error = await ensure_monitor_auth(request=request)
     if auth_error:
         return auth_error
@@ -304,7 +304,7 @@ async def monitor_state(request: Request) -> dict[str, Any] | JSONResponse:
 
 
 @app.get("/monitor/api/queue")
-async def queue_details(request: Request) -> dict[str, Any] | JSONResponse:
+async def queue_details(request: Request) -> Any:
     auth_error = await ensure_monitor_auth(request)
     if auth_error:
         return auth_error
@@ -312,7 +312,7 @@ async def queue_details(request: Request) -> dict[str, Any] | JSONResponse:
 
 
 @app.get("/monitor/api/models")
-async def models(request: Request) -> dict[str, Any] | JSONResponse:
+async def models(request: Request) -> Any:
     auth_error = await ensure_monitor_auth(request)
     if auth_error:
         return auth_error
