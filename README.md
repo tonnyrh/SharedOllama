@@ -1,7 +1,7 @@
 # SharedOllama
 
 Shared Ollama server for multiple local Docker projects and optional remote clients.
-Includes a monitoring proxy that records traffic and usage telemetry.
+Now includes a built-in monitor/proxy layer for queueing, request limiting, and live operational visibility.
 
 ## Start
 
@@ -16,6 +16,33 @@ docker compose --project-name sharedollama ps
 Invoke-WebRequest -UseBasicParsing http://localhost:11435/api/version
 Invoke-WebRequest -UseBasicParsing http://localhost:11435/monitor/summary
 ```
+
+## Monitor page
+
+Open:
+
+```text
+http://localhost:11435/monitor
+```
+
+If `MONITOR_TOKEN` is set, open with:
+
+```text
+http://localhost:11435/monitor?token=<MONITOR_TOKEN>
+```
+
+This page provides:
+
+- Loaded model visibility
+- Queue depth and queue item details
+- Request totals and rate-limit metrics
+- Logs, errors, and alerts
+
+API endpoints:
+
+- `GET /monitor/api/state` full monitor state payload
+- `GET /monitor/api/queue` queued request details
+- `GET /monitor/api/models` current loaded models
 
 ## Pull a model
 
@@ -37,32 +64,17 @@ For remote clients:
 OLLAMA_URL=http://<HOST_IP>:11435
 ```
 
-## Monitoring data captured
+## Queue and rate-limit settings
 
-The proxy records:
-
-- Incoming traffic (all proxied requests)
-- Credits used (prompt + completion token counts when available)
-- Remote IP and remote location headers (if available)
-- Model used
-- Memory used (from `/api/ps` model memory fields)
-- Response time
-- Errors/status codes
-- Prompt
-- Answer
-
-## Monitoring endpoints
-
-- `GET /monitor/summary` - aggregated metrics
-- `GET /monitor/requests?limit=100` - recent request logs
-
-## Retention (automatic delete)
-
-Logs are automatically deleted after 30 days by default.
-You can configure this with:
+Configure in `.env`:
 
 ```text
-MONITOR_RETENTION_DAYS=30
+RATE_LIMIT_PER_MINUTE=120
+MAX_QUEUE_SIZE=200
+QUEUE_WORKERS=2
+ALERT_QUEUE_THRESHOLD=50
+UPSTREAM_TIMEOUT_SECONDS=300
+MONITOR_TOKEN=
 ```
 
 ## Stop

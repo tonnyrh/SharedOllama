@@ -11,29 +11,23 @@ services:
       timeout: 10s
       retries: 5
       start_period: 20s
-
-  monitor-proxy:
+  monitor:
     build:
-      context: ./monitor-proxy
-    container_name: shared-ollama-proxy
+      context: ./monitor
+    container_name: shared-ollama-monitor
     depends_on:
       - ollama
     environment:
-      OLLAMA_INTERNAL_URL: http://ollama:11434
-      MONITOR_DB_PATH: /data/monitor.db
-      MONITOR_RETENTION_DAYS: ${MONITOR_RETENTION_DAYS:-30}
+      OLLAMA_BACKEND_URL: http://ollama:11434
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
+      MAX_QUEUE_SIZE: ${MAX_QUEUE_SIZE:-200}
+      QUEUE_WORKERS: ${QUEUE_WORKERS:-2}
+      ALERT_QUEUE_THRESHOLD: ${ALERT_QUEUE_THRESHOLD:-50}
+      UPSTREAM_TIMEOUT_SECONDS: ${UPSTREAM_TIMEOUT_SECONDS:-300}
+      MONITOR_TOKEN: ${MONITOR_TOKEN:-}
     ports:
       - "${OLLAMA_BIND_ADDRESS:-0.0.0.0}:${OLLAMA_PUBLISHED_PORT:-11435}:8080"
-    volumes:
-      - monitor_data:/data
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/monitor/summary', timeout=5).read()"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 20s
 
 volumes:
   ollama_data:
-  monitor_data:
