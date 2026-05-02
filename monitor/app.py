@@ -19,6 +19,9 @@ MAX_BODY_PREVIEW_LENGTH = 200
 MAX_HISTORY_PREVIEW_LENGTH = 280
 MAX_DETAIL_TEXT_LENGTH = 12000
 BINARY_CONTENT_PREFIXES = ("image/", "audio/", "video/")
+DEFAULT_CLIENT_PRIORITY = 100
+MIN_CLIENT_PRIORITY = 0
+MAX_CLIENT_PRIORITY = 1000
 
 
 def now_iso() -> str:
@@ -41,6 +44,20 @@ class QueueItemInfo:
     client_ip_source: str
     client_kind: str
     client_details: str
+    client_priority: int
+
+
+def parse_priority_value(raw_value: Any) -> int | None:
+    if raw_value is None:
+        return None
+    text = str(raw_value).strip()
+    if not text:
+        return None
+    try:
+        parsed = int(text)
+    except (TypeError, ValueError):
+        return None
+    return max(MIN_CLIENT_PRIORITY, min(MAX_CLIENT_PRIORITY, parsed))
 
 
 class MonitorState:
@@ -84,7 +101,10 @@ class MonitorState:
         self.processed_total = 0
         self.failed_total = 0
 
-        self.queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=self.max_queue_size)
+        self.queue: asyncio.PriorityQueue[tuple[int, float, int, dict[str, Any]]] = asyncio.PriorityQueue(
+            maxsize=self.max_queue_size
+        )
+        self.queue_sequence = 0
         self.active = 0
         self.pending: dict[str, QueueItemInfo] = {}
         self.logs: deque[dict[str, Any]] = deque(maxlen=self.max_log_entries)
@@ -128,7 +148,7 @@ class MonitorState:
     async def queue_snapshot(self) -> list[dict[str, Any]]:
         async with self.lock:
             items = [asdict(item) for item in self.pending.values()]
-        return sorted(items, key=lambda i: i["enqueue_time"])
+        return sorted(items, key=lambda i: (i.get("client_priority", DEFAULT_CLIENT_PRIORITY), i["enqueue_time"]))
 
     async def add_history_entry(self, entry: dict[str, Any]) -> None:
         async with self.lock:
@@ -147,9 +167,27 @@ class MonitorState:
 
     async def set_client_state(self, client_key: str, state_name: str) -> dict[str, Any]:
         async with self.lock:
-            entry = self.client_controls.get(client_key, {"state": "active", "updated_at": now_iso()})
+            entry = self.client_controls.get(
+                client_key,
+                {"state": "active", "updated_at": now_iso(), "priority": DEFAULT_CLIENT_PRIORITY},
+            )
             entry["state"] = state_name
             entry["updated_at"] = now_iso()
+            if "priority" not in entry:
+                entry["priority"] = DEFAULT_CLIENT_PRIORITY
+            self.client_controls[client_key] = entry
+            return {"client_key": client_key, **entry}
+
+    async def set_client_priority(self, client_key: str, priority: int, source: str = "manual") -> dict[str, Any]:
+        normalized_priority = max(MIN_CLIENT_PRIORITY, min(MAX_CLIENT_PRIORITY, int(priority)))
+        async with self.lock:
+            entry = self.client_controls.get(
+                client_key,
+                {"state": "active", "updated_at": now_iso(), "priority": DEFAULT_CLIENT_PRIORITY},
+            )
+            entry["priority"] = normalized_priority
+            entry["updated_at"] = now_iso()
+            entry["priority_source"] = source
             self.client_controls[client_key] = entry
             return {"client_key": client_key, **entry}
 
@@ -160,15 +198,27 @@ class MonitorState:
                 return "active"
             return str(entry.get("state", "active"))
 
+    async def get_client_priority(self, client_key: str) -> int:
+        async with self.lock:
+            entry = self.client_controls.get(client_key)
+            if not entry:
+                return DEFAULT_CLIENT_PRIORITY
+            parsed_priority = parse_priority_value(entry.get("priority"))
+            if parsed_priority is None:
+                return DEFAULT_CLIENT_PRIORITY
+            return parsed_priority
+
     async def cancel_pending_for_client(self, client_key: str, reason: str) -> int:
-        drained: list[dict[str, Any]] = []
+        drained: list[tuple[int, float, int, dict[str, Any]]] = []
         removed = 0
 
         while True:
             try:
-                item = self.queue.get_nowait()
+                queue_item = self.queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+
+            _, _, _, item = queue_item
 
             if item.get("client_key") == client_key:
                 removed += 1
@@ -180,11 +230,11 @@ class MonitorState:
                     self.pending.pop(request_id, None)
                 self.queue.task_done()
             else:
-                drained.append(item)
+                drained.append(queue_item)
                 self.queue.task_done()
 
-        for item in drained:
-            await self.queue.put(item)
+        for queue_item in drained:
+            await self.queue.put(queue_item)
 
         return removed
 
@@ -219,16 +269,21 @@ class MonitorState:
                     "client_ip_source": item.get("client_ip_source", "unknown"),
                     "client_kind": item.get("client_kind", "unknown"),
                     "client_details": item.get("client_details", ""),
+                    "client_priority": int(item.get("client_priority", DEFAULT_CLIENT_PRIORITY)),
                     "queued_count": 0,
                     "completed_count": 0,
                     "failed_count": 0,
                     "last_seen": None,
                     "state": control_map.get(client_key, {}).get("state", "active"),
+                    "priority": int(control_map.get(client_key, {}).get("priority", DEFAULT_CLIENT_PRIORITY)),
                     "updated_at": control_map.get(client_key, {}).get("updated_at"),
                 },
             )
             entry["queued_count"] += 1
             entry["last_seen"] = max_iso(entry["last_seen"], now_iso())
+            entry["priority"] = int(
+                control_map.get(client_key, {}).get("priority", entry.get("client_priority", DEFAULT_CLIENT_PRIORITY))
+            )
 
         for item in history_items:
             client_key = str(item.get("client_key", "unknown"))
@@ -241,11 +296,13 @@ class MonitorState:
                     "client_ip_source": item.get("client_ip_source", "unknown"),
                     "client_kind": item.get("client_kind", "unknown"),
                     "client_details": item.get("client_details", ""),
+                    "client_priority": int(item.get("client_priority", DEFAULT_CLIENT_PRIORITY)),
                     "queued_count": 0,
                     "completed_count": 0,
                     "failed_count": 0,
                     "last_seen": None,
                     "state": control_map.get(client_key, {}).get("state", "active"),
+                    "priority": int(control_map.get(client_key, {}).get("priority", DEFAULT_CLIENT_PRIORITY)),
                     "updated_at": control_map.get(client_key, {}).get("updated_at"),
                 },
             )
@@ -256,8 +313,14 @@ class MonitorState:
             completed_at = str(item.get("completed_at") or "")
             if completed_at:
                 entry["last_seen"] = max_iso(entry["last_seen"], completed_at)
+            entry["priority"] = int(
+                control_map.get(client_key, {}).get("priority", entry.get("client_priority", DEFAULT_CLIENT_PRIORITY))
+            )
 
-        return sorted(summary.values(), key=lambda item: (item["queued_count"], item["completed_count"]), reverse=True)
+        return sorted(
+            summary.values(),
+            key=lambda item: (item["priority"], -item["queued_count"], -item["completed_count"]),
+        )
 
     async def refresh_models(self) -> None:
         try:
@@ -358,7 +421,7 @@ class MonitorState:
 
     async def process_queue(self) -> None:
         while True:
-            item = await self.queue.get()
+            _, _, _, item = await self.queue.get()
             request_id = item["request_id"]
             future = item["future"]
             async with self.lock:
@@ -406,6 +469,7 @@ class MonitorState:
                         "client_ip_source": item.get("client_ip_source", "unknown"),
                         "client_kind": item.get("client_kind", "unknown"),
                         "client_details": item.get("client_details", ""),
+                        "client_priority": int(item.get("client_priority", DEFAULT_CLIENT_PRIORITY)),
                         "status_code": resp.status_code,
                         "duration_ms": round((time.time() - started) * 1000, 2),
                         "enqueue_time": item.get("enqueue_time"),
@@ -440,6 +504,7 @@ class MonitorState:
                         "client_ip_source": item.get("client_ip_source", "unknown"),
                         "client_kind": item.get("client_kind", "unknown"),
                         "client_details": item.get("client_details", ""),
+                        "client_priority": int(item.get("client_priority", DEFAULT_CLIENT_PRIORITY)),
                         "status_code": None,
                         "duration_ms": round((time.time() - started) * 1000, 2),
                         "enqueue_time": item.get("enqueue_time"),
@@ -566,7 +631,7 @@ async def monitor_page(request: Request) -> Response:
       <h2>Client Controls</h2>
             <div class="inline-note">Observed IP may be a Docker or NAT peer. When a real client IP is provided through forwarding headers, the monitor prefers that value automatically.</div>
       <table>
-                <thead><tr><th>Client</th><th>Type</th><th>Observed IP</th><th>IP Source</th><th>Queued</th><th>Done</th><th>Failed</th><th>State</th><th>Info</th><th>Actions</th></tr></thead>
+                <thead><tr><th>Client</th><th>Type</th><th>Observed IP</th><th>IP Source</th><th>Priority</th><th>Queued</th><th>Done</th><th>Failed</th><th>State</th><th>Info</th><th>Actions</th></tr></thead>
         <tbody id="clients"></tbody>
       </table>
     </div>
@@ -574,7 +639,7 @@ async def monitor_page(request: Request) -> Response:
       <h2>Queued Requests</h2>
       <table>
                                 <caption style="text-align:left; padding:6px; font-size:12px;">Queued write requests waiting for Ollama processing. The IP column shows the observed IP inside the monitor and may be a Docker or NAT peer. Double-click a row to open full request details.</caption>
-                <thead><tr><th>ID</th><th>Client</th><th>Observed IP</th><th>IP Source</th><th>Type</th><th>Method</th><th>Path</th><th>Queued At (Unix)</th><th>Body Preview</th></tr></thead>
+                <thead><tr><th>ID</th><th>Client</th><th>Observed IP</th><th>IP Source</th><th>Type</th><th>Priority</th><th>Method</th><th>Path</th><th>Queued At (Unix)</th><th>Body Preview</th></tr></thead>
         <tbody id="queue"></tbody>
       </table>
     </div>
@@ -640,13 +705,32 @@ async def monitor_page(request: Request) -> Response:
         await refresh();
       }
 
+            async function setClientPriority(clientKey, value) {
+                const parsed = Number(value);
+                if (!Number.isInteger(parsed) || parsed < 0 || parsed > 1000) {
+                    alert('Priority must be an integer between 0 and 1000. Lower value means higher priority.');
+                    return;
+                }
+                const response = await fetch('/monitor/api/clients/' + encodeURIComponent(clientKey) + '/priority' + window.location.search, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ priority: parsed })
+                });
+                if (!response.ok) {
+                    const payload = await response.json().catch(() => ({ error: 'Unknown error' }));
+                    alert(payload.error || 'Failed updating client priority');
+                    return;
+                }
+                await refresh();
+            }
+
       function renderClients(clients) {
         const clientsEl = document.getElementById('clients');
         clientsEl.innerHTML = '';
         (Array.isArray(clients) ? clients : []).forEach((client) => {
           const tr = document.createElement('tr');
 
-          [client.client_label, client.client_kind, client.client_ip, client.client_ip_source, client.queued_count, client.completed_count, client.failed_count].forEach((value) => {
+                    [client.client_label, client.client_kind, client.client_ip, client.client_ip_source, client.priority, client.queued_count, client.completed_count, client.failed_count].forEach((value) => {
             const td = document.createElement('td');
             td.textContent = String(value ?? '');
             tr.appendChild(td);
@@ -683,6 +767,22 @@ async def monitor_page(request: Request) -> Response:
           resumeBtn.onclick = () => setClientState(client.client_key, 'resume');
           actionsTd.appendChild(resumeBtn);
 
+          const priorityInput = document.createElement('input');
+          priorityInput.type = 'number';
+          priorityInput.min = '0';
+          priorityInput.max = '1000';
+          priorityInput.value = String(client.priority ?? 100);
+          priorityInput.style.width = '68px';
+          priorityInput.style.marginLeft = '6px';
+          actionsTd.appendChild(priorityInput);
+
+          const priorityBtn = document.createElement('button');
+          priorityBtn.className = 'button secondary';
+          priorityBtn.style.marginLeft = '6px';
+          priorityBtn.textContent = 'Set priority';
+          priorityBtn.onclick = () => setClientPriority(client.client_key, priorityInput.value);
+          actionsTd.appendChild(priorityBtn);
+
           tr.appendChild(actionsTd);
           clientsEl.appendChild(tr);
         });
@@ -698,7 +798,7 @@ async def monitor_page(request: Request) -> Response:
                     tr.addEventListener('dblclick', () => {
                         window.open(detailsUrl(q.request_id), '_blank', 'noopener,noreferrer');
                     });
-          [q.request_id, q.client_label, q.client_ip, q.client_ip_source, q.client_kind, q.method, q.path, q.enqueue_time, q.body_preview].forEach((value) => {
+                    [q.request_id, q.client_label, q.client_ip, q.client_ip_source, q.client_kind, q.client_priority, q.method, q.path, q.enqueue_time, q.body_preview].forEach((value) => {
             const td = document.createElement('td');
             td.textContent = String(value ?? '');
             tr.appendChild(td);
@@ -840,6 +940,30 @@ async def update_client_state(request: Request, client_key: str) -> Any:
     await state.add_log("WARN", "Client state changed", client_key=client_key, state=next_state, cancelled_queued=cancelled)
     await state.record_metric_snapshot()
     return {"client": updated, "cancelled_queued": cancelled}
+
+
+@app.post("/monitor/api/clients/{client_key}/priority")
+async def update_client_priority(request: Request, client_key: str) -> Any:
+    auth_error = await ensure_monitor_auth(request)
+    if auth_error:
+        return auth_error
+
+    payload = await request.json()
+    priority = parse_priority_value(payload.get("priority"))
+    if priority is None:
+        return JSONResponse(
+            {
+                "error": (
+                    f"invalid priority, expected integer between {MIN_CLIENT_PRIORITY} and {MAX_CLIENT_PRIORITY}"
+                )
+            },
+            status_code=400,
+        )
+
+    updated = await state.set_client_priority(client_key, priority=priority, source="manual")
+    await state.add_log("INFO", "Client priority changed", client_key=client_key, priority=priority)
+    await state.record_metric_snapshot()
+    return {"client": updated}
 
 
 @app.get("/monitor/graph", response_class=HTMLResponse)
@@ -1394,6 +1518,7 @@ def build_client_info(request: Request) -> dict[str, str]:
     user_agent = headers.get("user-agent", "")
     forwarded = headers.get("x-forwarded-for", "")
     real_ip = headers.get("x-real-ip", "")
+    explicit_client_key = headers.get("x-client-key") or ""
     explicit_client_name = (
         headers.get("x-client-name")
         or headers.get("x-client-id")
@@ -1421,7 +1546,12 @@ def build_client_info(request: Request) -> dict[str, str]:
 
     label_parts = [display_name, display_ip.strip()]
     client_label = " | ".join(part for part in label_parts if part) or client_ip or "unknown client"
-    key_suffix = explicit_client_name.strip().lower()
+    key_suffix = explicit_client_key.strip().lower() or explicit_client_name.strip().lower()
+    if not key_suffix and not has_forwarded_identity and client_ip_source == "socket-peer-nat-hidden":
+        if user_agent:
+            key_suffix = f"ua:{clip_text(user_agent.lower(), 60)}"
+        elif host:
+            key_suffix = f"host:{clip_text(host.lower(), 60)}"
     client_key = f"{client_ip}|{key_suffix}" if key_suffix else client_ip
 
     detail_parts = [
@@ -1433,6 +1563,8 @@ def build_client_info(request: Request) -> dict[str, str]:
         detail_parts.append("note=Real remote host IP is hidden by Docker/NAT unless x-forwarded-for or x-real-ip is sent")
     if client_name:
         detail_parts.append(f"name={client_name}")
+    if explicit_client_key.strip():
+        detail_parts.append(f"client_key={clip_text(explicit_client_key.strip(), 80)}")
     if host:
         detail_parts.append(f"host={host}")
     if origin:
@@ -1648,6 +1780,10 @@ async def proxy(full_path: str, request: Request) -> Response:
         if k.lower() not in {"host", "content-length", "connection", "accept-encoding"}
     }
     request_id = str(uuid.uuid4())
+    requested_priority = parse_priority_value(request.headers.get("x-client-priority"))
+    if requested_priority is not None:
+        await state.set_client_priority(client_info["client_key"], requested_priority, source="request-header")
+    client_priority = await state.get_client_priority(client_info["client_key"])
 
     original_content_type = request.headers.get("content-type", "")
     request_json = safe_json_parse(body, original_content_type)
@@ -1748,6 +1884,7 @@ async def proxy(full_path: str, request: Request) -> Response:
         client_ip_source=client_info["client_ip_source"],
         client_kind=client_info["client_kind"],
         client_details=client_info["client_details"],
+        client_priority=client_priority,
     )
     loop = asyncio.get_running_loop()
     result_future: asyncio.Future[dict[str, Any]] = loop.create_future()
@@ -1755,8 +1892,16 @@ async def proxy(full_path: str, request: Request) -> Response:
     async with state.lock:
         state.pending[request_id] = item_info
 
+    async with state.lock:
+        state.queue_sequence += 1
+        queue_sequence = state.queue_sequence
+
     await state.queue.put(
-        {
+        (
+            item_info.client_priority,
+            item_info.enqueue_time,
+            queue_sequence,
+            {
             "request_id": request_id,
             "method": request.method.upper(),
             "path": path,
@@ -1772,7 +1917,9 @@ async def proxy(full_path: str, request: Request) -> Response:
             "client_ip_source": item_info.client_ip_source,
             "client_kind": item_info.client_kind,
             "client_details": item_info.client_details,
-        }
+            "client_priority": item_info.client_priority,
+            },
+        )
     )
 
     if state.queue.qsize() >= state.alert_queue_threshold:
@@ -1791,6 +1938,7 @@ async def proxy(full_path: str, request: Request) -> Response:
         queue_size=state.queue.qsize(),
         client_key=item_info.client_key,
         client_ip=item_info.client_ip,
+        client_priority=item_info.client_priority,
     )
 
     try:

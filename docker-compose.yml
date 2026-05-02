@@ -18,7 +18,7 @@ services:
     depends_on:
       - ollama
     environment:
-      OLLAMA_BACKEND_URL: http://ollama:11434
+      OLLAMA_BACKEND_URL: ${OLLAMA_BACKEND_URL:-http://ollama:11434}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
       MAX_QUEUE_SIZE: ${MAX_QUEUE_SIZE:-200}
       QUEUE_WORKERS: ${QUEUE_WORKERS:-2}
