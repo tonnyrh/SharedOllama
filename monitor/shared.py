@@ -36,7 +36,8 @@ def load_runtime_config() -> dict[str, Any]:
     try:
         if not RUNTIME_CONFIG_PATH.exists():
             return {}
-        raw = json.loads(RUNTIME_CONFIG_PATH.read_text(encoding="utf-8"))
+        # PowerShell may write UTF-8 with BOM; utf-8-sig handles both BOM and non-BOM files.
+        raw = json.loads(RUNTIME_CONFIG_PATH.read_text(encoding="utf-8-sig"))
         return raw if isinstance(raw, dict) else {}
     except Exception:
         return {}
