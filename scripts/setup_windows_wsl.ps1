@@ -3,7 +3,8 @@ param(
     [switch]$SkipOllamaInstall,
     [switch]$SkipFirewall,
     [switch]$SkipPortProxy,
-    [switch]$SkipWslInstall
+    [switch]$SkipWslInstall,
+    [switch]$UseMirroredNetworking
 )
 
 Set-StrictMode -Version Latest
@@ -78,6 +79,42 @@ function Set-EnvKey {
     $lines | Set-Content -Path $EnvFilePath -Encoding UTF8
 }
 
+function Get-WslPrimaryIp {
+    $ip = ""
+    if ([string]::IsNullOrWhiteSpace($Distro)) {
+        $ip = & wsl -e bash -lc "hostname -I | awk '{print `$1}'"
+    }
+    else {
+        $ip = & wsl -d $Distro -e bash -lc "hostname -I | awk '{print `$1}'"
+    }
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to read WSL IP address"
+    }
+
+    $ip = "$ip".Trim()
+    if (-not $ip) {
+        throw "WSL IP address is empty"
+    }
+
+    return $ip
+}
+
+function Enable-MirroredNetworking {
+    $wslConfigPath = Join-Path $HOME ".wslconfig"
+    Write-Log "Enabling WSL mirrored networking in $wslConfigPath"
+
+    $content = @"
+[wsl2]
+networkingMode=mirrored
+localhostForwarding=true
+firewall=true
+"@
+
+    Set-Content -Path $wslConfigPath -Value $content -Encoding UTF8
+    Write-Log "Mirrored networking configured. Run 'wsl --shutdown' and rerun this script."
+}
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $envPath = Join-Path $repoRoot ".env"
 $runtimeConfigPath = Join-Path $repoRoot "monitor\runtime_config.json"
@@ -99,6 +136,16 @@ $runtimeConfig | ConvertTo-Json -Depth 5 | Set-Content -Path $runtimeConfigPath 
 
 Set-EnvKey -EnvFilePath $envPath -Key "OLLAMA_BACKEND_URL" -Value "http://127.0.0.1:11435"
 
+if ($UseMirroredNetworking) {
+    if (-not $isAdmin) {
+        Write-Log "Cannot enable mirrored networking without admin rights"
+        throw "Administrator rights required for -UseMirroredNetworking"
+    }
+
+    Enable-MirroredNetworking
+    return
+}
+
 if ($SkipFirewall) {
     Write-Log "Skipping firewall setup"
 }
@@ -118,18 +165,6 @@ else {
     }
 }
 
-if ($SkipPortProxy) {
-    Write-Log "Skipping portproxy setup"
-}
-elseif (-not $isAdmin) {
-    Write-Log "Skipping portproxy setup (admin rights required)"
-}
-else {
-    Write-Log "Configuring portproxy 0.0.0.0:11434 -> 127.0.0.1:11435"
-    & netsh interface portproxy delete v4tov4 listenport=11434 listenaddress=0.0.0.0 | Out-Null
-    & netsh interface portproxy add v4tov4 listenport=11434 listenaddress=0.0.0.0 connectport=11435 connectaddress=127.0.0.1 | Out-Null
-}
-
 if ($SkipWslInstall) {
     Write-Log "Skipping WSL install/start steps"
 }
@@ -145,6 +180,26 @@ else {
     Invoke-Wsl -Command "systemctl --user daemon-reload >/dev/null 2>&1 || true"
     Invoke-Wsl -Command "systemctl --user enable --now sharedollama-proxy.service >/dev/null 2>&1 || true"
     Invoke-Wsl -Command "systemctl --user enable --now sharedollama-admin.service >/dev/null 2>&1 || true"
+}
+
+if ($SkipPortProxy) {
+    Write-Log "Skipping portproxy setup"
+}
+elseif (-not $isAdmin) {
+    Write-Log "Skipping portproxy setup (admin rights required)"
+}
+else {
+    $wslIp = Get-WslPrimaryIp
+    Write-Log "Configuring portproxy 0.0.0.0:11434 -> ${wslIp}:11434"
+    & netsh interface portproxy delete v4tov4 listenport=11434 listenaddress=0.0.0.0 | Out-Null
+    & netsh interface portproxy add v4tov4 listenport=11434 listenaddress=0.0.0.0 connectport=11434 connectaddress=$wslIp | Out-Null
+
+    Write-Log "Configuring portproxy 0.0.0.0:11444 -> ${wslIp}:11444"
+    & netsh interface portproxy delete v4tov4 listenport=11444 listenaddress=0.0.0.0 | Out-Null
+    & netsh interface portproxy add v4tov4 listenport=11444 listenaddress=0.0.0.0 connectport=11444 connectaddress=$wslIp | Out-Null
+
+    Write-Log "Warning: netsh portproxy does not preserve client source IP."
+    Write-Log "Use -UseMirroredNetworking for true remote source IP in monitor."
 }
 
 Write-Log "Verifying endpoints"

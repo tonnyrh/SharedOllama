@@ -29,7 +29,7 @@ What it does:
 
 - Writes runtime config for single WSL Ollama instance.
 - Configures Windows firewall rules (`11434`, `11444`) when run as Administrator.
-- Configures Windows portproxy (`0.0.0.0:11434 -> 127.0.0.1:11435`) when run as Administrator.
+- Configures Windows portproxy to WSL proxy/admin ports when run as Administrator.
 - Calls WSL installer and starts `sharedollama-proxy` and `sharedollama-admin` services.
 - Verifies proxy and admin endpoints.
 
@@ -40,6 +40,7 @@ Useful flags:
 - `-SkipPortProxy`
 - `-SkipWslInstall`
 - `-Distro <name>`
+- `-UseMirroredNetworking` (recommended when you need true remote source IP)
 
 Minimal usage example:
 
@@ -128,4 +129,6 @@ export MONITOR_TOKEN="change-me"
 
 - WSL control log: `~/.sharedollama/ollama.log`
 - If LAN clients cannot connect to `11434`, run setup script in elevated PowerShell to apply firewall and portproxy.
+- `netsh portproxy` does not preserve source IP. Clients can appear as localhost in monitor.
+- For true remote source IP visibility, run setup with `-UseMirroredNetworking`, run `wsl --shutdown`, then run setup again.
 - If corporate policy blocks local firewall rules, request GPO inbound allow for TCP `11434` and `11444`.
