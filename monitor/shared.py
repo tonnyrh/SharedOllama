@@ -255,6 +255,7 @@ class MonitorState:
         self.alerts: deque[dict[str, Any]] = deque(maxlen=self.max_alert_entries)
         self.history: deque[dict[str, Any]] = deque(maxlen=self.max_history_entries)
         self.client_controls: dict[str, dict[str, Any]] = {}
+        self.client_registry: dict[str, dict[str, Any]] = {}
         self.metric_history: deque[dict[str, Any]] = deque(maxlen=240)
         self.models_cache: list[dict[str, Any]] = []
         self.last_models_refresh: str | None = None
@@ -385,6 +386,35 @@ class MonitorState:
             self.client_controls[client_key] = entry
             return {"client_key": client_key, **entry}
 
+    async def register_client(
+        self,
+        client_key: str,
+        client_label: str,
+        client_ip: str,
+        client_ip_source: str,
+        client_kind: str,
+        client_details: str,
+    ) -> None:
+        async with self.lock:
+            existing = self.client_registry.get(client_key, {})
+            self.client_registry[client_key] = {
+                "client_key": client_key,
+                "client_label": client_label or existing.get("client_label", client_key),
+                "client_ip": client_ip or existing.get("client_ip", ""),
+                "client_ip_source": client_ip_source or existing.get("client_ip_source", "unknown"),
+                "client_kind": client_kind or existing.get("client_kind", "unknown"),
+                "client_details": client_details or existing.get("client_details", ""),
+                "last_seen": now_iso(),
+            }
+
+            control_entry = self.client_controls.get(client_key)
+            if control_entry is None:
+                self.client_controls[client_key] = {
+                    "state": "active",
+                    "updated_at": now_iso(),
+                    "priority": DEFAULT_CLIENT_PRIORITY,
+                }
+
     async def set_client_priority(self, client_key: str, priority: int, source: str = "manual") -> dict[str, Any]:
         normalized_priority = max(MIN_CLIENT_PRIORITY, min(MAX_CLIENT_PRIORITY, int(priority)))
         async with self.lock:
@@ -463,8 +493,27 @@ class MonitorState:
             queue_items = [asdict(item) for item in self.pending.values()]
             history_items = list(self.history)
             control_map = dict(self.client_controls)
+            registry_map = dict(self.client_registry)
 
         summary: dict[str, dict[str, Any]] = {}
+        for client_key, item in registry_map.items():
+            summary[client_key] = {
+                "client_key": client_key,
+                "client_label": item.get("client_label", client_key),
+                "client_ip": item.get("client_ip", ""),
+                "client_ip_source": item.get("client_ip_source", "unknown"),
+                "client_kind": item.get("client_kind", "unknown"),
+                "client_details": item.get("client_details", ""),
+                "client_priority": int(control_map.get(client_key, {}).get("priority", DEFAULT_CLIENT_PRIORITY)),
+                "queued_count": 0,
+                "completed_count": 0,
+                "failed_count": 0,
+                "last_seen": item.get("last_seen"),
+                "state": control_map.get(client_key, {}).get("state", "active"),
+                "priority": int(control_map.get(client_key, {}).get("priority", DEFAULT_CLIENT_PRIORITY)),
+                "updated_at": control_map.get(client_key, {}).get("updated_at"),
+            }
+
         for item in queue_items:
             client_key = str(item.get("client_key", "unknown"))
             entry = summary.setdefault(

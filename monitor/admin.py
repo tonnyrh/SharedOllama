@@ -6,6 +6,7 @@ import time
 from contextlib import asynccontextmanager
 from html import escape
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
@@ -23,6 +24,30 @@ from .shared import (
 )
 
 state = MonitorState()
+
+
+async def _proxy_monitor_request(path: str, method: str = "GET", payload: dict | None = None) -> Response:
+  runtime = await state.runtime_config_snapshot()
+  proxy_port = parse_port(runtime.get("shared_port", 11434), 11434)
+  url = f"http://127.0.0.1:{proxy_port}{path}"
+  headers: dict[str, str] = {}
+  if state.monitor_token:
+    headers["x-monitor-token"] = state.monitor_token
+
+  try:
+    async with httpx.AsyncClient(timeout=6.0) as client:
+      response = await client.request(method=method, url=url, headers=headers, json=payload)
+  except Exception as exc:
+    return JSONResponse({"error": f"proxy monitor unavailable: {exc}"}, status_code=502)
+
+  content_type = response.headers.get("content-type", "")
+  if "application/json" in content_type.lower():
+    try:
+      return JSONResponse(response.json(), status_code=response.status_code)
+    except Exception:
+      return JSONResponse({"error": "invalid proxy monitor response"}, status_code=502)
+
+  return JSONResponse({"error": "unexpected proxy monitor response"}, status_code=502)
 
 
 @asynccontextmanager
@@ -389,110 +414,82 @@ async def monitor_state(request: Request):
     auth_error = await ensure_monitor_auth(request, state.monitor_token)
     if auth_error:
         return auth_error
-    queue_items = await state.queue_snapshot()
-    client_items = await state.client_snapshot()
-    async with state.lock:
-        stats = {
-            "uptime_seconds": int(time.time() - state.started_at),
-            "requests_total": state.requests_total,
-            "requests_in_current_minute": state.requests_in_window,
-            "rate_limit_per_minute": state.rate_limit_per_minute,
-            "rate_limited_total": state.rate_limited_total,
-            "queued_count": len(queue_items),
-            "queue_max_size": state.max_queue_size,
-            "active_workers": state.active,
-            "workers": state.workers,
-            "processed_total": state.processed_total,
-            "failed_total": state.failed_total,
-            "last_models_refresh": state.last_models_refresh,
-            "backend_url": state.backend_url,
-        }
-        return {
-            "stats": stats,
-            "models": state.models_cache,
-            "queue": queue_items,
-            "clients": client_items,
-            "history": list(state.history),
-            "logs": list(state.logs),
-            "errors": list(state.errors),
-            "alerts": list(state.alerts),
-            "metrics_history": list(state.metric_history),
-        }
+    return await _proxy_monitor_request("/monitor/api/state")
 
 
 @app.get("/monitor/api/admin/state")
 async def admin_state(request: Request):
-    auth_error = await ensure_monitor_auth(request, state.monitor_token)
-    if auth_error:
-        return auth_error
+  auth_error = await ensure_monitor_auth(request, state.monitor_token)
+  if auth_error:
+    return auth_error
 
-    runtime = await state.runtime_config_snapshot()
-    backend = await check_backend_version(runtime.get("backend_url", state.backend_url))
-    client_port = parse_port(runtime.get("shared_port", 11434), 11434)
-    client_endpoint = {
-      "url": f"http://127.0.0.1:{client_port}",
-      "host": "127.0.0.1",
-      "port": client_port,
-      "note": "Client applications should connect to this endpoint.",
-    }
-    ollama_status = await run_ollama_control(
-        action="status",
-        host=str(runtime.get("ollama_host", DEFAULT_OLLAMA_HOST)),
-        port=parse_port(runtime.get("ollama_port", DEFAULT_OLLAMA_PORT), DEFAULT_OLLAMA_PORT),
-    )
+  runtime = await state.runtime_config_snapshot()
+  backend = await check_backend_version(runtime.get("backend_url", state.backend_url))
+  client_port = parse_port(runtime.get("shared_port", 11434), 11434)
+  client_endpoint = {
+    "url": f"http://127.0.0.1:{client_port}",
+    "host": "127.0.0.1",
+    "port": client_port,
+    "note": "Client applications should connect to this endpoint.",
+  }
+  ollama_status = await run_ollama_control(
+    action="status",
+    host=str(runtime.get("ollama_host", DEFAULT_OLLAMA_HOST)),
+    port=parse_port(runtime.get("ollama_port", DEFAULT_OLLAMA_PORT), DEFAULT_OLLAMA_PORT),
+  )
 
-    return {
-        "runtime_config": runtime,
-      "client_endpoint": client_endpoint,
-        "backend": backend,
-        "ollama": ollama_status,
-    }
+  return {
+    "runtime_config": runtime,
+    "client_endpoint": client_endpoint,
+    "backend": backend,
+    "ollama": ollama_status,
+  }
 
 
 @app.post("/monitor/api/admin/config")
 async def admin_update_config(request: Request):
-    auth_error = await ensure_monitor_auth(request, state.monitor_token)
-    if auth_error:
-        return auth_error
+  auth_error = await ensure_monitor_auth(request, state.monitor_token)
+  if auth_error:
+    return auth_error
 
-    payload = await request.json()
-    host = str(payload.get("ollama_host", DEFAULT_OLLAMA_HOST)).strip()
-    port = parse_port(payload.get("ollama_port", DEFAULT_OLLAMA_PORT), DEFAULT_OLLAMA_PORT)
-    backend_url = str(payload.get("backend_url", "")).strip().rstrip("/") or f"http://{host}:{port}"
+  payload = await request.json()
+  host = str(payload.get("ollama_host", DEFAULT_OLLAMA_HOST)).strip()
+  port = parse_port(payload.get("ollama_port", DEFAULT_OLLAMA_PORT), DEFAULT_OLLAMA_PORT)
+  backend_url = str(payload.get("backend_url", "")).strip().rstrip("/") or f"http://{host}:{port}"
 
-    saved = await state.update_runtime_config(
-        backend_url=backend_url,
-        shared_port=11434,
-        ollama_host=host,
-        ollama_port=port,
-    )
-    await state.mark_admin_action("config_saved", backend_url=backend_url)
-    return {"ok": True, "config": saved}
+  saved = await state.update_runtime_config(
+    backend_url=backend_url,
+    shared_port=11434,
+    ollama_host=host,
+    ollama_port=port,
+  )
+  await state.mark_admin_action("config_saved", backend_url=backend_url)
+  return {"ok": True, "config": saved}
 
 
 @app.post("/monitor/api/admin/ollama/{action}")
 async def admin_ollama_action(request: Request, action: str):
-    auth_error = await ensure_monitor_auth(request, state.monitor_token)
-    if auth_error:
-        return auth_error
+  auth_error = await ensure_monitor_auth(request, state.monitor_token)
+  if auth_error:
+    return auth_error
 
-    normalized_action = action.strip().lower()
-    if normalized_action not in {"start", "stop", "restart", "status"}:
-        return JSONResponse({"error": "invalid action"}, status_code=400)
+  normalized_action = action.strip().lower()
+  if normalized_action not in {"start", "stop", "restart", "status"}:
+    return JSONResponse({"error": "invalid action"}, status_code=400)
 
-    runtime = await state.runtime_config_snapshot()
-    result = await run_ollama_control(
-        action=normalized_action,
-        host=str(runtime.get("ollama_host", DEFAULT_OLLAMA_HOST)),
-        port=parse_port(runtime.get("ollama_port", DEFAULT_OLLAMA_PORT), DEFAULT_OLLAMA_PORT),
-    )
-    await state.mark_admin_action(
-        f"ollama_{normalized_action}",
-        ok=result.get("ok", False),
-        exit_code=result.get("exit_code"),
-    )
-    status_code = 200 if result.get("ok") else 500
-    return JSONResponse({"ok": bool(result.get("ok")), "action": normalized_action, "result": result}, status_code=status_code)
+  runtime = await state.runtime_config_snapshot()
+  result = await run_ollama_control(
+    action=normalized_action,
+    host=str(runtime.get("ollama_host", DEFAULT_OLLAMA_HOST)),
+    port=parse_port(runtime.get("ollama_port", DEFAULT_OLLAMA_PORT), DEFAULT_OLLAMA_PORT),
+  )
+  await state.mark_admin_action(
+    f"ollama_{normalized_action}",
+    ok=result.get("ok", False),
+    exit_code=result.get("exit_code"),
+  )
+  status_code = 200 if result.get("ok") else 500
+  return JSONResponse({"ok": bool(result.get("ok")), "action": normalized_action, "result": result}, status_code=status_code)
 
 
 @app.get("/monitor/api/clients")
@@ -500,7 +497,7 @@ async def client_list(request: Request):
     auth_error = await ensure_monitor_auth(request, state.monitor_token)
     if auth_error:
         return auth_error
-    return {"clients": await state.client_snapshot()}
+    return await _proxy_monitor_request("/monitor/api/clients")
 
 
 @app.post("/monitor/api/clients/{client_key}/state")
@@ -508,27 +505,12 @@ async def update_client_state(request: Request, client_key: str):
     auth_error = await ensure_monitor_auth(request, state.monitor_token)
     if auth_error:
         return auth_error
-
     payload = await request.json()
-    action = str(payload.get("action", "")).strip().lower()
-    if action not in {"pause", "block", "resume"}:
-        return JSONResponse({"error": "invalid action"}, status_code=400)
-
-    if action == "resume":
-        updated = await state.set_client_state(client_key, "active")
-        await state.add_log("INFO", "Client resumed", client_key=client_key)
-        await state.record_metric_snapshot()
-        return {"client": updated, "cancelled_queued": 0}
-
-    next_state = "paused" if action == "pause" else "blocked"
-    updated = await state.set_client_state(client_key, next_state)
-    cancelled = 0
-    if action == "block":
-        cancelled = await state.cancel_pending_for_client(client_key, "Client is blocked")
-
-    await state.add_log("WARN", "Client state changed", client_key=client_key, state=next_state, cancelled_queued=cancelled)
-    await state.record_metric_snapshot()
-    return {"client": updated, "cancelled_queued": cancelled}
+    return await _proxy_monitor_request(
+        path=f"/monitor/api/clients/{client_key}/state",
+        method="POST",
+        payload={"action": payload.get("action", "")},
+    )
 
 
 if __name__ == "__main__":

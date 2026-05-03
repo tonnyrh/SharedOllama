@@ -1,19 +1,216 @@
 """Pure Ollama proxy for SharedOllama. Runs on standard port (11434)."""
 
 import json
+import time
 import uuid
 from urllib.parse import urlparse
+from ipaddress import ip_address
+from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 
-from .shared import MonitorState
+from .shared import MonitorState, ensure_monitor_auth, now_iso
 
 state = MonitorState()
 
 
 app = FastAPI(title="SharedOllama Proxy")
+
+
+def _normalize_ip_candidate(value: str) -> str:
+    token = str(value or "").strip().strip('"').strip("'")
+    if not token:
+        return ""
+    if token.lower().startswith("for="):
+        token = token[4:].strip().strip('"').strip("'")
+    if ";" in token:
+        token = token.split(";", 1)[0].strip()
+    if token.lower() in {"unknown", "_hidden"}:
+        return ""
+    if token.startswith("[") and "]" in token:
+        token = token[1 : token.index("]")]
+    if "." in token and token.count(":") == 1:
+        host, port = token.rsplit(":", 1)
+        if port.isdigit():
+            token = host
+    try:
+        return str(ip_address(token))
+    except ValueError:
+        return ""
+
+
+def _extract_remote_ip(request: Request) -> str:
+    headers = {k.lower(): v for k, v in request.headers.items()}
+    for header_name in ["x-real-ip", "true-client-ip", "cf-connecting-ip", "x-client-ip"]:
+        normalized = _normalize_ip_candidate(headers.get(header_name, ""))
+        if normalized:
+            return normalized
+    xff = headers.get("x-forwarded-for", "")
+    if xff:
+        for candidate in xff.split(","):
+            normalized = _normalize_ip_candidate(candidate)
+            if normalized:
+                return normalized
+    if request.client and request.client.host:
+        normalized = _normalize_ip_candidate(request.client.host)
+        if normalized:
+            return normalized
+    return "unknown"
+
+
+def _classify_client_kind(client_ip: str, headers: dict[str, str]) -> str:
+    user_agent = headers.get("user-agent", "").lower()
+    forwarded = headers.get("x-forwarded-for", "").lower()
+    if "docker" in user_agent or "container" in user_agent:
+        return "docker-like"
+    if forwarded:
+        return "proxied"
+    try:
+        parsed = ip_address(client_ip)
+    except ValueError:
+        return "unknown"
+    if parsed.is_loopback:
+        return "loopback"
+    if parsed.is_private:
+        return "local-network"
+    return "remote"
+
+
+def _build_client_info(request: Request) -> dict[str, str]:
+    headers = {k.lower(): v for k, v in request.headers.items()}
+    client_ip = _extract_remote_ip(request)
+    user_agent = headers.get("user-agent", "")
+    explicit_client_key = headers.get("x-client-key") or ""
+    explicit_client_name = headers.get("x-client-name") or headers.get("x-client-id") or ""
+    client_name = explicit_client_name.strip() or (user_agent[:80] if user_agent else "")
+    client_kind = _classify_client_kind(client_ip, headers)
+    key_suffix = explicit_client_key.strip().lower() or explicit_client_name.strip().lower()
+    client_key = f"{client_ip}|{key_suffix}" if key_suffix else client_ip
+    client_label = " | ".join(p for p in [client_name, client_ip] if p) or client_key
+    return {
+        "client_key": client_key,
+        "client_label": client_label[:140],
+        "client_ip": client_ip,
+        "client_ip_source": "forwarded-header" if headers.get("x-forwarded-for") else "socket-peer",
+        "client_kind": client_kind,
+        "client_details": f"ua={user_agent[:120]} | host={headers.get('host', '')}",
+    }
+
+
+async def _record_request_outcome(
+    request_id: str,
+    method: str,
+    path: str,
+    client_info: dict[str, str],
+    status_code: int | None,
+    duration_ms: float,
+    request_body: bytes,
+    response_body: bytes,
+    error_text: str = "",
+) -> None:
+    body_preview = request_body.decode("utf-8", errors="ignore")[:200].replace("\n", " ") if request_body else ""
+    response_preview = response_body.decode("utf-8", errors="ignore")[:200].replace("\n", " ") if response_body else ""
+    await state.add_history_entry(
+        {
+            "request_id": request_id,
+            "method": method,
+            "path": path,
+            "client_key": client_info["client_key"],
+            "client_label": client_info["client_label"],
+            "client_ip": client_info["client_ip"],
+            "client_ip_source": client_info["client_ip_source"],
+            "client_kind": client_info["client_kind"],
+            "client_details": client_info["client_details"],
+            "client_priority": await state.get_client_priority(client_info["client_key"]),
+            "status_code": status_code,
+            "duration_ms": round(duration_ms, 2),
+            "enqueue_time": None,
+            "completed_at": now_iso(),
+            "question_preview": body_preview,
+            "answer_preview": response_preview if not error_text else error_text,
+            "request_preview": body_preview,
+            "response_preview": response_preview,
+            "request_details": body_preview,
+            "response_details": response_preview if not error_text else error_text,
+            "request_model": "",
+            "request_prompt": body_preview,
+            "response_model": "",
+            "response_text": response_preview,
+            "response_created_at": "",
+            "response_done_reason": "",
+            "response_done": "",
+            "error": error_text,
+        }
+    )
+
+
+@app.get("/monitor/api/state")
+async def monitor_state(request: Request) -> Any:
+    auth_error = await ensure_monitor_auth(request, state.monitor_token)
+    if auth_error:
+        return auth_error
+    queue_items = await state.queue_snapshot()
+    client_items = await state.client_snapshot()
+    async with state.lock:
+        stats = {
+            "uptime_seconds": int(time.time() - state.started_at),
+            "requests_total": state.requests_total,
+            "requests_in_current_minute": state.requests_in_window,
+            "rate_limit_per_minute": state.rate_limit_per_minute,
+            "rate_limited_total": state.rate_limited_total,
+            "queued_count": len(queue_items),
+            "queue_max_size": state.max_queue_size,
+            "active_workers": state.active,
+            "workers": state.workers,
+            "processed_total": state.processed_total,
+            "failed_total": state.failed_total,
+            "last_models_refresh": state.last_models_refresh,
+            "backend_url": state.backend_url,
+        }
+        return {
+            "stats": stats,
+            "models": state.models_cache,
+            "queue": queue_items,
+            "clients": client_items,
+            "history": list(state.history),
+            "logs": list(state.logs),
+            "errors": list(state.errors),
+            "alerts": list(state.alerts),
+            "metrics_history": list(state.metric_history),
+        }
+
+
+@app.get("/monitor/api/clients")
+async def client_list(request: Request) -> Any:
+    auth_error = await ensure_monitor_auth(request, state.monitor_token)
+    if auth_error:
+        return auth_error
+    return {"clients": await state.client_snapshot()}
+
+
+@app.post("/monitor/api/clients/{client_key}/state")
+async def update_client_state(request: Request, client_key: str) -> Any:
+    auth_error = await ensure_monitor_auth(request, state.monitor_token)
+    if auth_error:
+        return auth_error
+    payload = await request.json()
+    action = str(payload.get("action", "")).strip().lower()
+    if action not in {"pause", "block", "resume"}:
+        return JSONResponse({"error": "invalid action"}, status_code=400)
+
+    if action == "resume":
+        updated = await state.set_client_state(client_key, "active")
+        await state.add_log("INFO", "Client resumed", client_key=client_key)
+        await state.record_metric_snapshot()
+        return {"client": updated, "cancelled_queued": 0}
+
+    next_state = "paused" if action == "pause" else "blocked"
+    updated = await state.set_client_state(client_key, next_state)
+    await state.add_log("WARN", "Client state changed", client_key=client_key, state=next_state)
+    await state.record_metric_snapshot()
+    return {"client": updated, "cancelled_queued": 0}
 
 
 def _extract_requested_model(path: str, request_body: bytes) -> str:
@@ -61,6 +258,41 @@ async def proxy(full_path: str, request: Request) -> Response:
     """Proxy all requests to the configured Ollama backend."""
     path = f"/{full_path}"
     target_url = f"{state.backend_url}{path}"
+    started = time.time()
+    client_info = _build_client_info(request)
+    await state.register_client(
+        client_key=client_info["client_key"],
+        client_label=client_info["client_label"],
+        client_ip=client_info["client_ip"],
+        client_ip_source=client_info["client_ip_source"],
+        client_kind=client_info["client_kind"],
+        client_details=client_info["client_details"],
+    )
+
+    client_state = await state.get_client_state(client_info["client_key"])
+    if client_state == "paused":
+        await state.add_log("WARN", "Request rejected for paused client", path=path, client_key=client_info["client_key"])
+        return JSONResponse({"error": "client is paused"}, status_code=423)
+    if client_state == "blocked":
+        await state.add_log("WARN", "Request rejected for blocked client", path=path, client_key=client_info["client_key"])
+        return JSONResponse({"error": "client is blocked"}, status_code=403)
+
+    allowed = await state.check_rate_limit()
+    if not allowed:
+        await state.add_log("WARN", "Rate limit exceeded", path=path, client_key=client_info["client_key"])
+        await _record_request_outcome(
+            request_id=str(uuid.uuid4()),
+            method=request.method.upper(),
+            path=path,
+            client_info=client_info,
+            status_code=429,
+            duration_ms=(time.time() - started) * 1000,
+            request_body=await request.body(),
+            response_body=b"",
+            error_text="rate limit exceeded",
+        )
+        await state.record_metric_snapshot()
+        return JSONResponse({"error": "rate limit exceeded"}, status_code=429)
 
     if _is_self_backend(target_url, request):
         return Response(
@@ -121,6 +353,20 @@ async def proxy(full_path: str, request: Request) -> Response:
             if key.lower() not in {"content-encoding", "transfer-encoding", "connection", "content-length"}
         }
 
+        await _record_request_outcome(
+            request_id=request_id,
+            method=request.method.upper(),
+            path=path,
+            client_info=client_info,
+            status_code=upstream_response.status_code,
+            duration_ms=(time.time() - started) * 1000,
+            request_body=request_body,
+            response_body=upstream_response.content,
+        )
+        async with state.lock:
+            state.processed_total += 1
+        await state.record_metric_snapshot()
+
         return Response(
             content=upstream_response.content,
             status_code=upstream_response.status_code,
@@ -129,6 +375,20 @@ async def proxy(full_path: str, request: Request) -> Response:
         )
 
     except Exception as exc:
+        async with state.lock:
+            state.failed_total += 1
+        await _record_request_outcome(
+            request_id=request_id,
+            method=request.method.upper(),
+            path=path,
+            client_info=client_info,
+            status_code=502,
+            duration_ms=(time.time() - started) * 1000,
+            request_body=request_body,
+            response_body=b"",
+            error_text=str(exc),
+        )
+        await state.record_metric_snapshot()
         return Response(
             content=json.dumps({"error": f"Proxy error: {str(exc)}"}),
             status_code=502,
