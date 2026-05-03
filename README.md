@@ -40,7 +40,7 @@ Useful flags:
 - `-SkipPortProxy`
 - `-SkipWslInstall`
 - `-Distro <name>`
-- `-UseMirroredNetworking` (recommended when you need true remote source IP)
+- `-UseMirroredNetworking` — writes `~/.wslconfig` with `networkingMode=mirrored`. Requires Windows build `22621.2359` or later. Run `wsl --shutdown` after, then rerun setup.
 
 Minimal usage example:
 
@@ -125,10 +125,29 @@ Set token to require auth for monitor/admin APIs:
 export MONITOR_TOKEN="change-me"
 ```
 
+## Remote Client Identity
+
+With `netsh portproxy` (NAT mode), all LAN clients appear as `localhost` or a Windows internal IP in the monitor.
+This is a Windows networking limitation — portproxy terminates the TCP connection and opens a new one, discarding the original source IP.
+
+Workarounds:
+
+1. **Upgrade Windows** to build `22621.2359` or later and use `-UseMirroredNetworking`. WSL will share the host IP and no portproxy is needed.
+2. **Set a client identity header** in your client app:
+   ```
+   x-client-name: my-laptop
+   ```
+   SharedOllama will use this as the display name in monitor regardless of IP.
+
+To check your Windows build:
+```powershell
+[System.Environment]::OSVersion.Version
+# Or: winver
+```
+Minimum required build for mirrored networking: `22621.2359` (Windows 11 22H2, October 2023 update).
+
 ## Troubleshooting
 
 - WSL control log: `~/.sharedollama/ollama.log`
 - If LAN clients cannot connect to `11434`, run setup script in elevated PowerShell to apply firewall and portproxy.
-- `netsh portproxy` does not preserve source IP. Clients can appear as localhost in monitor.
-- For true remote source IP visibility, run setup with `-UseMirroredNetworking`, run `wsl --shutdown`, then run setup again.
 - If corporate policy blocks local firewall rules, request GPO inbound allow for TCP `11434` and `11444`.
