@@ -115,6 +115,19 @@ firewall=true
     Write-Log "Mirrored networking configured. Run 'wsl --shutdown' and rerun this script."
 }
 
+function Test-MirroredNetworkingSupport {
+    $version = [System.Environment]::OSVersion.Version
+    $build = [int]$version.Build
+    $revision = [int]$version.Revision
+    $supported = ($build -gt 22621) -or ($build -eq 22621 -and $revision -ge 2359)
+    return [PSCustomObject]@{
+        Supported = $supported
+        Build = $build
+        Revision = $revision
+        VersionText = "$($version.Major).$($version.Minor).$build.$revision"
+    }
+}
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $envPath = Join-Path $repoRoot ".env"
 $runtimeConfigPath = Join-Path $repoRoot "monitor\runtime_config.json"
@@ -140,6 +153,13 @@ if ($UseMirroredNetworking) {
     if (-not $isAdmin) {
         Write-Log "Cannot enable mirrored networking without admin rights"
         throw "Administrator rights required for -UseMirroredNetworking"
+    }
+
+    $mirrorCheck = Test-MirroredNetworkingSupport
+    if (-not $mirrorCheck.Supported) {
+        Write-Log "Mirrored networking is not supported on this Windows build ($($mirrorCheck.VersionText))."
+        Write-Log "Minimum required build is 22621.2359. Keeping current NAT/portproxy setup."
+        throw "Update Windows and rerun with -UseMirroredNetworking"
     }
 
     Enable-MirroredNetworking

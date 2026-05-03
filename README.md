@@ -146,6 +146,12 @@ To check your Windows build:
 ```
 Minimum required build for mirrored networking: `22621.2359` (Windows 11 22H2, October 2023 update).
 
+Current status for older builds (for example `22621.525`):
+
+- Keep `netsh portproxy` enabled for `11434` and `11444`.
+- Expect monitor to show internal relay IPs (for example `172.18.x.x`) instead of true LAN source IP.
+- Use `x-client-name` (or `x-client-id`) to identify remote clients reliably until Windows is updated.
+
 ## Troubleshooting
 
 - WSL control log: `~/.sharedollama/ollama.log`
