@@ -84,9 +84,9 @@ After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=${ROOT_DIR}/monitor
+WorkingDirectory=${ROOT_DIR}
 Environment=SHAREDOLLAMA_RUNTIME_CONFIG=${ROOT_DIR}/monitor/runtime_config.json
-ExecStart=${VENV_DIR}/bin/python ${ROOT_DIR}/monitor/app.py
+ExecStart=${VENV_DIR}/bin/python -m monitor.app
 Restart=always
 RestartSec=3
 
@@ -102,10 +102,10 @@ After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=${ROOT_DIR}/monitor
+WorkingDirectory=${ROOT_DIR}
 Environment=SHAREDOLLAMA_RUNTIME_CONFIG=${ROOT_DIR}/monitor/runtime_config.json
 Environment=SHAREDOLLAMA_OLLAMA_CONTROL_SCRIPT=${ROOT_DIR}/scripts/wsl_ollama_control.sh
-ExecStart=${VENV_DIR}/bin/python ${ROOT_DIR}/monitor/admin.py
+ExecStart=${VENV_DIR}/bin/python -m monitor.admin
 Restart=always
 RestartSec=3
 
