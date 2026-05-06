@@ -224,6 +224,9 @@ else {
 
 # ── Start tasks now (without waiting for reboot) ──────────────────────────────
 Write-Log "Starting services now"
+# Stop any existing Python processes so the new config is picked up cleanly
+Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 1
 Start-ScheduledTask -TaskName $ProxyTaskName
 Start-ScheduledTask -TaskName $AdminTaskName
 Start-Sleep -Seconds 4
