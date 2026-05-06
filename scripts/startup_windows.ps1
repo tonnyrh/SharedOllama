@@ -80,4 +80,22 @@ catch {
     Write-Log "WARNING: Failed to update portproxy rules (admin rights required): $($_.Exception.Message)"
 }
 
+# --- Keep WSL alive so it does not auto-shutdown and kill the services ---
+# Without an active Windows-side holder, WSL exits ~8s after the last session ends,
+# which stops all systemd services. A hidden wsl.exe sleep process prevents that.
+Write-Log "Starting WSL keep-alive process"
+
+# Kill any leftover keep-alive from a previous run
+Get-Process -Name wsl -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like "*sleep*2147483647*" } |
+    Stop-Process -Force -ErrorAction SilentlyContinue
+
+if ([string]::IsNullOrWhiteSpace($Distro)) {
+    Start-Process wsl.exe -WindowStyle Hidden -ArgumentList "-e", "bash", "-lc", "sleep 2147483647"
+}
+else {
+    Start-Process wsl.exe -WindowStyle Hidden -ArgumentList "-d", $Distro, "-e", "bash", "-lc", "sleep 2147483647"
+}
+
+Write-Log "WSL keep-alive started"
 Write-Log "SharedOllama startup complete"
