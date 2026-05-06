@@ -467,6 +467,15 @@ async def admin_update_config(request: Request):
   return {"ok": True, "config": saved}
 
 
+@app.post("/monitor/api/admin/refresh-models")
+async def admin_refresh_models(request: Request):
+  auth_error = await ensure_monitor_auth(request, state.monitor_token)
+  if auth_error:
+    return auth_error
+  await state.refresh_models()
+  return {"ok": True, "count": len(state.models_cache)}
+
+
 @app.post("/monitor/api/admin/ollama/{action}")
 async def admin_ollama_action(request: Request, action: str):
   auth_error = await ensure_monitor_auth(request, state.monitor_token)
