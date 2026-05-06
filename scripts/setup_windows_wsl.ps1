@@ -251,6 +251,25 @@ if (-not $SkipPortProxy -and $isAdmin) {
     & netsh interface portproxy show all
 }
 
+Write-Log "Registering Windows startup task"
+$taskName = "SharedOllamaStartup"
+$startupScript = Join-Path $repoRoot "scripts\startup_windows.ps1"
+$distroArg = if ([string]::IsNullOrWhiteSpace($Distro)) { "" } else { " -Distro '$Distro'" }
+$psArgs = "-NonInteractive -NoProfile -ExecutionPolicy Bypass -File `"$startupScript`"$distroArg"
+
+# Build the scheduled task: run at logon, with highest privileges (needed for netsh)
+$action  = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $psArgs
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -StartWhenAvailable
+$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
+
+# Remove existing task if present, then register new one
+Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+    -Settings $settings -Principal $principal -Description "Start SharedOllama WSL services and update portproxy on logon" | Out-Null
+
+Write-Log "Scheduled task '$taskName' registered - will run at next logon"
+
 Write-Log "Setup finished"
 Write-Log "Input: Start the service"
 Write-Log "Output: Service started successfully."

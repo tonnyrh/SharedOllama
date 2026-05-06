@@ -42,10 +42,37 @@ Useful flags:
 - `-Distro <name>`
 - `-UseMirroredNetworking` — writes `~/.wslconfig` with `networkingMode=mirrored`. Requires Windows build `22621.2359` or later. Run `wsl --shutdown` after, then rerun setup.
 
+Also registers a Windows Scheduled Task (`SharedOllamaStartup`) that runs automatically at every logon.
+The task starts WSL services and refreshes the portproxy rules with the current WSL IP — no manual action needed after a reboot.
+
 Minimal usage example:
 
 - Input: `powershell -ExecutionPolicy Bypass -File .\scripts\setup_windows_wsl.ps1 -SkipOllamaInstall`
 - Output: `Service started successfully.`
+
+## Auto-Start on Reboot
+
+The setup script registers a Windows Scheduled Task that runs `scripts\startup_windows.ps1` at every logon.
+
+What the startup task does:
+
+1. Waits for WSL to become available (up to 60 seconds).
+2. Starts `sharedollama-proxy.service` and `sharedollama-admin.service` via `systemctl --user`.
+3. Reads the current WSL IP and updates `netsh portproxy` rules for ports `11434` and `11444`.
+
+Startup log: `%LOCALAPPDATA%\SharedOllama\startup.log`
+
+To verify the task is registered:
+
+```powershell
+Get-ScheduledTask -TaskName SharedOllamaStartup
+```
+
+To run it manually (for example after a manual WSL restart):
+
+```powershell
+Start-ScheduledTask -TaskName SharedOllamaStartup
+```
 
 ## WSL-only Install
 
@@ -155,5 +182,6 @@ Current status for older builds (for example `22621.525`):
 ## Troubleshooting
 
 - WSL control log: `~/.sharedollama/ollama.log`
+- Startup task log: `%LOCALAPPDATA%\SharedOllama\startup.log`
 - If LAN clients cannot connect to `11434`, run setup script in elevated PowerShell to apply firewall and portproxy.
 - If corporate policy blocks local firewall rules, request GPO inbound allow for TCP `11434` and `11444`.
