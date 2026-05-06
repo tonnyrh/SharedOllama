@@ -1,7 +1,0 @@
-{
-  "backend_url": "http://127.0.0.1:11435",
-  "shared_port": 11434,
-  "ollama_host": "127.0.0.1",
-  "ollama_port": 11435,
-  "updated_at": "2026-05-03T11:39:52.473172+00:00"
-}
