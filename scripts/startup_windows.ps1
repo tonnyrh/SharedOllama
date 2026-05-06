@@ -19,55 +19,46 @@ function Write-Log {
     catch { }
 }
 
-function Invoke-Wsl {
-    param([string]$Command)
-    if ([string]::IsNullOrWhiteSpace($Distro)) {
-        & wsl -e bash -lc $Command
-    }
-    else {
-        & wsl -d $Distro -e bash -lc $Command
-    }
-    return $LASTEXITCODE
-}
-
-function Get-WslPrimaryIp {
-    $ip = ""
-    if ([string]::IsNullOrWhiteSpace($Distro)) {
-        $ip = & wsl -e bash -lc "hostname -I | awk '{print `$1}'"
-    }
-    else {
-        $ip = & wsl -d $Distro -e bash -lc "hostname -I | awk '{print `$1}'"
-    }
-    return "$ip".Trim()
-}
-
 Write-Log "SharedOllama startup triggered"
 
-# --- Wait for WSL to become ready (WSL may need time after logon) ---
-$maxWait = 60
-$waited = 0
-Write-Log "Waiting for WSL to become available..."
-while ($waited -lt $maxWait) {
-    $exit = Invoke-Wsl -Command "echo ready"
-    if ($exit -eq 0) { break }
-    Start-Sleep -Seconds 3
-    $waited += 3
+# --- Run a single WSL session that waits for systemd, starts services if needed, and returns the WSL IP.
+# Combining everything into one bash call avoids multiple WSL restarts between invocations. ---
+Write-Log "Initializing WSL and services"
+$wslScript = @'
+# Wait for systemd user session to be available (max 60s)
+for i in $(seq 1 20); do
+    systemctl --user is-system-running >/dev/null 2>&1 && break
+    sleep 3
+done
+
+# Start services only if not already active (avoid interrupting running services)
+for svc in sharedollama-proxy.service sharedollama-admin.service; do
+    if ! systemctl --user is-active --quiet "$svc"; then
+        systemctl --user start "$svc" 2>/dev/null || true
+    fi
+done
+
+# Return WSL IP
+hostname -I | awk '{print $1}'
+'@
+
+$wslOutput = ""
+if ([string]::IsNullOrWhiteSpace($Distro)) {
+    $wslOutput = & wsl -e bash -lc $wslScript
+}
+else {
+    $wslOutput = & wsl -d $Distro -e bash -lc $wslScript
 }
 
-if ($waited -ge $maxWait) {
-    Write-Log "ERROR: WSL did not become available within $maxWait seconds"
+if ($LASTEXITCODE -ne 0) {
+    Write-Log "ERROR: WSL session failed (exit=$LASTEXITCODE)"
     exit 1
 }
 
-Write-Log "WSL is ready"
-
-# --- Start systemd user services inside WSL ---
-Write-Log "Reloading and starting systemd user services"
-Invoke-Wsl -Command "systemctl --user daemon-reload 2>/dev/null; systemctl --user start sharedollama-proxy.service; systemctl --user start sharedollama-admin.service"
-Write-Log "WSL services started"
+Write-Log "WSL services ready"
 
 # --- Update netsh portproxy with the current WSL IP ---
-$wslIp = Get-WslPrimaryIp
+$wslIp = "$wslOutput".Trim().Split("`n")[-1].Trim()
 if ([string]::IsNullOrWhiteSpace($wslIp)) {
     Write-Log "ERROR: Could not get WSL IP address"
     exit 1
