@@ -12,17 +12,28 @@ $DataDir        = "C:\ProgramData\SharedOllama"
 $VenvDir        = Join-Path $DataDir ".venv"
 $VenvPython     = Join-Path $VenvDir "Scripts\python.exe"
 $RepoRoot       = Split-Path -Parent $PSScriptRoot
-$RuntimeConfig  = Join-Path $RepoRoot "monitor\runtime_config.json"
-$ControlScript  = Join-Path $RepoRoot "scripts\ollama_control_windows.ps1"
+$RuntimeConfigPath  = Join-Path $RepoRoot "monitor\runtime_config.json"
+$ControlScriptPath  = Join-Path $RepoRoot "scripts\ollama_control_windows.ps1"
 $ProxyTaskName  = "SharedOllamaProxy"
 $AdminTaskName  = "SharedOllamaAdmin"
 $OllamaPort     = 11435   # Ollama backend; proxy exposes 11434 to clients
+$SetupLog       = "C:\ProgramData\SharedOllama\setup.log"
 
-function Write-Log { param([string]$Message); Write-Host "[sharedollama-setup] $Message" }
+function Write-Log {
+    param([string]$Message)
+    $line = "[sharedollama-setup] $Message"
+    Write-Host $line
+    try {
+        New-Item -ItemType Directory -Path "C:\ProgramData\SharedOllama" -Force -ErrorAction SilentlyContinue | Out-Null
+        Add-Content -Path $SetupLog -Value $line -Encoding UTF8
+    } catch {}
+}
 
 function Test-IsAdmin {
-    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-    ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    # IsInRole check fails for Azure AD accounts even when elevated.
+    # Use token integrity level instead: High (12288) or System (16384) = elevated.
+    $groups = (whoami /groups 2>$null) -join " "
+    return $groups -match "S-1-16-12288|S-1-16-16384"
 }
 
 function Remove-Task { param([string]$Name)
@@ -77,10 +88,37 @@ Write-Log "Setting OLLAMA_HOST=127.0.0.1:$OllamaPort (user environment)"
 [System.Environment]::SetEnvironmentVariable("OLLAMA_HOST", "127.0.0.1:$OllamaPort", "User")
 
 # ── Python ───────────────────────────────────────────────────────────────────
-$pythonExe = Get-Command python -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
-if (-not $pythonExe) {
-    $pythonExe = Get-Command python3 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+function Find-RealPython {
+    # Machine-wide installs first (accessible by SYSTEM), then user installs, skip Store stubs
+    $candidates = @()
+
+    # Machine-wide (Program Files)
+    foreach ($root in @("C:\Program Files\Python3*", "C:\Program Files (x86)\Python3*", "C:\Python3*")) {
+        Get-Item $root -ErrorAction SilentlyContinue | Sort-Object Name -Descending |
+            ForEach-Object { $candidates += (Join-Path $_.FullName "python.exe") }
+    }
+
+    # User install under AppData (fallback)
+    $userPyRoot = "$env:LOCALAPPDATA\Programs\Python"
+    if (Test-Path $userPyRoot) {
+        Get-ChildItem -Path $userPyRoot -Filter "python.exe" -Recurse -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending |
+            ForEach-Object { $candidates += $_.FullName }
+    }
+
+    # PATH-based (last resort)
+    $candidates += (Get-Command python  -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source)
+    $candidates += (Get-Command python3 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source)
+
+    foreach ($c in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($c)) { continue }
+        if ($c -like "*WindowsApps*") { continue }   # Store stub - skip
+        if (Test-Path $c) { return $c }
+    }
+    return $null
 }
+
+$pythonExe = Find-RealPython
 
 if (-not $pythonExe) {
     Write-Log "Python not found. Attempting install via winget..."
@@ -118,21 +156,22 @@ Write-Log "Installing Python dependencies"
 
 # ── Runtime config ────────────────────────────────────────────────────────────
 Write-Log "Writing runtime_config.json"
-$runtimeConfig = [ordered]@{
+$configPayload = [ordered]@{
     backend_url  = "http://127.0.0.1:$OllamaPort"
     shared_port  = 11434
     ollama_host  = "127.0.0.1"
     ollama_port  = $OllamaPort
     updated_at   = (Get-Date).ToUniversalTime().ToString("o")
 }
-$runtimeConfig | ConvertTo-Json -Depth 5 | Set-Content -Path $RuntimeConfig -Encoding UTF8
+$configPayload | ConvertTo-Json -Depth 5 | Set-Content -Path $RuntimeConfigPath -Encoding UTF8
 
 # ── Machine environment variables (read by services running as SYSTEM) ────────
 Write-Log "Setting machine environment variables"
-[System.Environment]::SetEnvironmentVariable("SHAREDOLLAMA_RUNTIME_CONFIG",        $RuntimeConfig,   "Machine")
-[System.Environment]::SetEnvironmentVariable("SHAREDOLLAMA_OLLAMA_CONTROL_SCRIPT", $ControlScript,   "Machine")
+[System.Environment]::SetEnvironmentVariable("SHAREDOLLAMA_RUNTIME_CONFIG",        $RuntimeConfigPath,  "Machine")
+[System.Environment]::SetEnvironmentVariable("SHAREDOLLAMA_OLLAMA_CONTROL_SCRIPT", $ControlScriptPath,  "Machine")
 
 # ── Scheduled tasks (AtStartup, SYSTEM) ──────────────────────────────────────
+# Python is machine-wide so SYSTEM can access the venv.
 Write-Log "Registering scheduled tasks for proxy and admin"
 
 $taskSettings = New-ScheduledTaskSettingsSet `
@@ -219,6 +258,6 @@ Write-Log "  Proxy : http://localhost:11434  (clients connect here)"
 Write-Log "  Admin : http://localhost:11444/monitor"
 Write-Log "  Ollama: starts at user logon on port $OllamaPort (OLLAMA_HOST set in user environment)"
 Write-Log ""
-Write-Log "Both services will start automatically at next boot (Windows Scheduled Tasks)."
+Write-Log "Proxy and admin start at boot (SYSTEM, no logon needed). Ollama starts at logon."
 Write-Log "Input: Start the service"
 Write-Log "Output: Service started successfully."
