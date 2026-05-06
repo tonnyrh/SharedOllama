@@ -122,9 +122,9 @@ async def monitor_page(request: Request) -> Response:
     </div>
     <div class="grid" id="stats"></div>
     <div class="section">
-      <h2>Admin: WSL Ollama Setup</h2>
-      <div class="inline-note">This section controls local WSL Ollama. Use Start/Restart to run Ollama on the configured host and port.</div>
-      <div class="strategy-note">Strategy: Client URL is the public ingress your apps connect to. Backend URL is internal and should normally point to WSL Ollama on a different port.</div>
+      <h2>Admin: Ollama Control</h2>
+      <div class="inline-note">Start, stop, or restart the local Ollama backend. Use Start/Restart to make Ollama available on the configured host and port.</div>
+      <div class="strategy-note">Strategy: Client URL is the public ingress your apps connect to. Backend URL is internal and should normally point to Ollama on a different port.</div>
       <div class="admin-status" id="adminStatus"></div>
       <div class="admin-grid">
         <div class="form-row">

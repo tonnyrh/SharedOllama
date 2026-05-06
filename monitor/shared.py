@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import sys
 import time
 from collections import deque
 from dataclasses import asdict, dataclass
@@ -27,9 +28,12 @@ DEFAULT_ADMIN_PORT = 11444
 APP_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = APP_DIR.parent
 RUNTIME_CONFIG_PATH = Path(os.getenv("SHAREDOLLAMA_RUNTIME_CONFIG", str(APP_DIR / "runtime_config.json")))
-OLLAMA_CONTROL_SCRIPT = Path(
-    os.getenv("SHAREDOLLAMA_OLLAMA_CONTROL_SCRIPT", str(PROJECT_DIR / "scripts" / "wsl_ollama_control.sh"))
+_default_control_script = (
+    str(PROJECT_DIR / "scripts" / "ollama_control_windows.ps1")
+    if sys.platform == "win32"
+    else str(PROJECT_DIR / "scripts" / "wsl_ollama_control.sh")
 )
+OLLAMA_CONTROL_SCRIPT = Path(os.getenv("SHAREDOLLAMA_OLLAMA_CONTROL_SCRIPT", _default_control_script))
 
 
 def load_runtime_config() -> dict[str, Any]:
@@ -112,10 +116,15 @@ async def run_ollama_control(action: str, host: str, port: int) -> dict[str, Any
             "stdout": "",
             "stderr": f"Missing control script at {OLLAMA_CONTROL_SCRIPT}",
         }
-    return await run_command(
-        ["bash", str(OLLAMA_CONTROL_SCRIPT), action, "--host", host, "--port", str(port)],
-        timeout_seconds=40.0,
-    )
+    if sys.platform == "win32":
+        cmd = [
+            "powershell.exe", "-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-File", str(OLLAMA_CONTROL_SCRIPT),
+            action, "-OllamaHost", host, "-OllamaPort", str(port),
+        ]
+    else:
+        cmd = ["bash", str(OLLAMA_CONTROL_SCRIPT), action, "--host", host, "--port", str(port)]
+    return await run_command(cmd, timeout_seconds=40.0)
 
 
 async def check_backend_version(backend_url: str) -> dict[str, Any]:
