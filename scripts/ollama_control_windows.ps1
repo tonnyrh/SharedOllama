@@ -13,14 +13,14 @@ function Write-Json {
         [bool]$Ok,
         [string]$ActionName,
         [bool]$Running,
-        [string]$Pid = "",
+        [string]$ProcessId = "",
         [string]$Note = ""
     )
     $okStr      = if ($Ok)      { "true" } else { "false" }
     $runningStr = if ($Running) { "true" } else { "false" }
     $logEscaped  = $LogFile.Replace("\", "\\")
     $noteEscaped = $Note.Replace('"', '\"')
-    Write-Output "{`"ok`":$okStr,`"action`":`"$ActionName`",`"running`":$runningStr,`"pid`":`"$Pid`",`"host`":`"$OllamaHost`",`"port`":`"$OllamaPort`",`"log_file`":`"$logEscaped`",`"message`":`"$noteEscaped`"}"
+    Write-Output "{`"ok`":$okStr,`"action`":`"$ActionName`",`"running`":$runningStr,`"pid`":`"$ProcessId`",`"host`":`"$OllamaHost`",`"port`":`"$OllamaPort`",`"log_file`":`"$logEscaped`",`"message`":`"$noteEscaped`"}"
 }
 
 function Find-OllamaExe {
@@ -42,7 +42,7 @@ function Get-OllamaPid {
 function Start-OllamaServe {
     $existingPid = Get-OllamaPid
     if ($existingPid) {
-        Write-Json -Ok $true -ActionName "start" -Running $true -Pid $existingPid -Note "ollama already running"
+        Write-Json -Ok $true -ActionName "start" -Running $true -ProcessId $existingPid -Note "ollama already running"
         return
     }
 
@@ -58,7 +58,7 @@ function Start-OllamaServe {
     Start-Sleep -Seconds 2
     $newPid = Get-OllamaPid
     if ($newPid) {
-        Write-Json -Ok $true -ActionName "start" -Running $true -Pid $newPid -Note "ollama started"
+        Write-Json -Ok $true -ActionName "start" -Running $true -ProcessId $newPid -Note "ollama started"
     }
     else {
         Write-Json -Ok $false -ActionName "start" -Running $false -Note "failed to start ollama"
@@ -77,17 +77,11 @@ function Stop-OllamaServe {
 
     $stillRunning = Get-OllamaPid
     if ($stillRunning) {
-        Write-Json -Ok $false -ActionName "stop" -Running $true -Pid $stillRunning -Note "ollama is still running"
+        Write-Json -Ok $false -ActionName "stop" -Running $true -ProcessId $stillRunning -Note "ollama is still running"
     }
     else {
         Write-Json -Ok $true -ActionName "stop" -Running $false -Note "ollama stopped"
     }
-}
-
-if (-not (Get-Command ollama -ErrorAction SilentlyContinue) -and
-    -not (Test-Path (Join-Path $env:LOCALAPPDATA "Programs\Ollama\ollama.exe"))) {
-    Write-Json -Ok $false -ActionName $Action -Running $false -Note "ollama command not found"
-    exit 1
 }
 
 switch ($Action) {
@@ -108,7 +102,7 @@ switch ($Action) {
     "status" {
         $runningPid = Get-OllamaPid
         if ($runningPid) {
-            Write-Json -Ok $true -ActionName "status" -Running $true -Pid $runningPid -Note "ollama running"
+            Write-Json -Ok $true -ActionName "status" -Running $true -ProcessId $runningPid -Note "ollama running"
         }
         else {
             Write-Json -Ok $true -ActionName "status" -Running $false -Note "ollama not running"
