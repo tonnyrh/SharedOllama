@@ -1,17 +1,23 @@
 """
 Call a local Ollama model via SharedOllama (http://localhost:11434).
 
+Model selection: if --model is omitted, the script reads config.json from the
+skill directory and picks the first model in the preferred list that is actually
+installed in Ollama. Edit config.json to match your hardware.
+
 Usage:
-  python call_ollama.py --model qwen2.5:7b --system "You are a coding assistant." --user "Write a Python hello world"
-  echo "def foo(): pass" | python call_ollama.py --model qwen2.5:7b --user "Add a docstring to this function"
+  python call_ollama.py --user "Write a Python hello world"
+  python call_ollama.py --model qwen2.5-coder:7b --user "Add a docstring to foo"
+  echo "def foo(): pass" | python call_ollama.py --user "Add a docstring"
 
 Flags:
-  --model     Ollama model name (required)
+  --model     Ollama model name (optional — auto-selected from config.json if omitted)
   --system    System prompt (optional, defaults to coding assistant)
   --user      User message (required unless piped via stdin)
-  --url       Ollama base URL (default: http://localhost:11434)
+  --url       Ollama base URL (overrides config.json if provided)
   --timeout   Request timeout in seconds (default: 120)
   --json      Print full JSON response instead of just the content
+  --list      List available models from config and exit
 """
 
 import argparse
@@ -19,6 +25,7 @@ import json
 import sys
 import urllib.request
 import urllib.error
+from pathlib import Path
 
 
 DEFAULT_SYSTEM = (
@@ -26,6 +33,41 @@ DEFAULT_SYSTEM = (
     "Produce correct, minimal, well-named code. "
     "Return only the requested output — no explanations unless asked."
 )
+
+SKILL_DIR = Path(__file__).resolve().parent.parent
+CONFIG_PATH = SKILL_DIR / "config.json"
+
+
+def _load_config() -> dict:
+    if CONFIG_PATH.exists():
+        try:
+            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _installed_models(base_url: str) -> set[str]:
+    """Return the set of model names currently installed in Ollama."""
+    try:
+        req = urllib.request.Request(f"{base_url.rstrip('/')}/api/tags")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        return {m["name"] for m in data.get("models", [])}
+    except Exception:
+        return set()
+
+
+def _select_model(config: dict, base_url: str) -> str | None:
+    """Pick the first preferred model that is installed in Ollama."""
+    preferred = [m["name"] for m in config.get("models", [])]
+    if not preferred:
+        return None
+    installed = _installed_models(base_url)
+    for name in preferred:
+        if name in installed:
+            return name
+    return None
 
 
 def call_ollama(model: str, system: str, user: str, base_url: str, timeout: int) -> dict:
@@ -43,7 +85,7 @@ def call_ollama(model: str, system: str, user: str, base_url: str, timeout: int)
         data=payload,
         headers={
             "Content-Type": "application/json",
-            "x-client-priority": "0",   # highest priority in SharedOllama queue
+            "x-client-priority": "0",
             "x-client-name": "ollama-worker-skill",
         },
         method="POST",
@@ -62,33 +104,64 @@ def call_ollama(model: str, system: str, user: str, base_url: str, timeout: int)
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Call a local Ollama model via SharedOllama.")
-    parser.add_argument("--model",   required=True, help="Ollama model name")
+    parser.add_argument("--model",   default=None, help="Model name (auto-selected from config.json if omitted)")
     parser.add_argument("--system",  default=DEFAULT_SYSTEM, help="System prompt")
     parser.add_argument("--user",    default=None, help="User message (or pipe via stdin)")
-    parser.add_argument("--url",     default="http://localhost:11434", help="Ollama base URL")
+    parser.add_argument("--url",     default=None, help="Ollama base URL (overrides config.json)")
     parser.add_argument("--timeout", type=int, default=120, help="Timeout in seconds")
     parser.add_argument("--json",    action="store_true", help="Print full JSON response")
+    parser.add_argument("--list",    action="store_true", help="List preferred models from config and exit")
     args = parser.parse_args()
 
-    # Accept user message from stdin if not provided as argument
+    config = _load_config()
+    base_url = args.url or config.get("ollama_url", "http://localhost:11434")
+
+    if args.list:
+        installed = _installed_models(base_url)
+        preferred = config.get("models", [])
+        if not preferred:
+            print("No models configured in config.json", file=sys.stderr)
+            sys.exit(1)
+        print(f"{'MODEL':<35} {'INSTALLED':<10} CONTEXT    NOTE")
+        print("-" * 80)
+        for m in preferred:
+            name = m["name"]
+            ctx = f"{m.get('context_tokens', '?'):,}"
+            flag = "yes" if name in installed else "no"
+            note = m.get("note", "")
+            print(f"{name:<35} {flag:<10} {ctx:<10} {note}")
+        sys.exit(0)
+
+    # Resolve model — explicit flag wins, then auto-select from config
+    model = args.model
+    if not model:
+        model = _select_model(config, base_url)
+        if not model:
+            print(
+                "LOCAL_MODEL_UNAVAILABLE: no model specified and none of the preferred "
+                "models from config.json are installed. Run --list to see options.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        print(f"[ollama-worker] auto-selected model: {model}", file=sys.stderr)
+
+    # Resolve user message
     if args.user is None:
         if sys.stdin.isatty():
             parser.error("--user is required when stdin is not piped")
-        stdin_content = sys.stdin.read().strip()
-        user_message = stdin_content
+        user_message = sys.stdin.read().strip()
     else:
         user_message = args.user
-        # Prepend stdin content if also piped
         if not sys.stdin.isatty():
             stdin_content = sys.stdin.read().strip()
             if stdin_content:
                 user_message = f"{stdin_content}\n\n{user_message}"
 
     result = call_ollama(
-        model=args.model,
+        model=model,
         system=args.system,
         user=user_message,
-        base_url=args.url,
+        base_url=base_url,
         timeout=args.timeout,
     )
 
