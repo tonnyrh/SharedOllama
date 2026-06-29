@@ -74,3 +74,4 @@ CRITICAL RULES:
 - If multiple changes are needed, emit multiple FILE_OP blocks in order
 - Preserve the original indentation style (tabs or spaces) of the target file
 - Do not add comments explaining what you changed — the code speaks for itself
+- When multiple ops modify the same file: later ops must reference content as it exists AFTER earlier ops are applied, not the original content
