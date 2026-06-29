@@ -455,36 +455,6 @@ class MonitorState:
                 return DEFAULT_CLIENT_PRIORITY
             return parsed_priority
 
-    async def cancel_pending_for_client(self, client_key: str, reason: str) -> int:
-        drained: list[tuple[int, float, int, dict[str, Any]]] = []
-        removed = 0
-
-        while True:
-            try:
-                queue_item = self.queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-
-            _, _, _, item = queue_item
-
-            if item.get("client_key") == client_key:
-                removed += 1
-                future = item.get("future")
-                if future is not None and not future.done():
-                    future.set_exception(RuntimeError(reason))
-                request_id = str(item.get("request_id", ""))
-                async with self.lock:
-                    self.pending.pop(request_id, None)
-                self.queue.task_done()
-            else:
-                drained.append(queue_item)
-                self.queue.task_done()
-
-        for queue_item in drained:
-            await self.queue.put(queue_item)
-
-        return removed
-
     async def record_metric_snapshot(self) -> None:
         async with self.lock:
             self.metric_history.append(

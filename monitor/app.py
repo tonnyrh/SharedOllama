@@ -1,8 +1,10 @@
 """Pure Ollama proxy for SharedOllama. Runs on standard port (11434)."""
 
+import asyncio
 import json
 import time
 import uuid
+from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 from ipaddress import ip_address
 from typing import Any
@@ -11,12 +13,9 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
-from .shared import MonitorState, ensure_monitor_auth, now_iso
+from .shared import MonitorState, QueueItemInfo, ensure_monitor_auth, now_iso
 
 state = MonitorState()
-
-
-app = FastAPI(title="SharedOllama Proxy")
 
 
 def _normalize_ip_candidate(value: str) -> str:
@@ -146,6 +145,98 @@ async def _record_request_outcome(
     )
 
 
+def _extract_requested_model(path: str, request_body: bytes) -> str:
+    """Read model name from known Ollama endpoints."""
+    if path not in {"/api/generate", "/api/chat", "/api/embeddings", "/api/embed", "/api/show"}:
+        return ""
+    if not request_body:
+        return ""
+
+    try:
+        payload = json.loads(request_body.decode("utf-8"))
+    except Exception:
+        return ""
+
+    if not isinstance(payload, dict):
+        return ""
+
+    # Some endpoints use "model", while /api/show typically uses "name".
+    model = payload.get("model") or payload.get("name")
+    return str(model).strip() if model is not None else ""
+
+
+def _is_self_backend(target_url: str, request: Request) -> bool:
+    """Detect backend configuration that points to this proxy instance."""
+    try:
+        parsed = urlparse(target_url)
+        backend_host = (parsed.hostname or "").lower()
+        backend_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        request_port = request.url.port or (443 if request.url.scheme == "https" else 80)
+    except Exception:
+        return False
+
+    local_hosts = {"127.0.0.1", "localhost", "0.0.0.0", "::1"}
+    return backend_host in local_hosts and backend_port == request_port
+
+
+def _is_stream_request(path: str, body: bytes) -> bool:
+    """Return True if this is a streaming Ollama request (the default for generate/chat)."""
+    if path not in {"/api/generate", "/api/chat"}:
+        return False
+    if not body:
+        return True  # Ollama defaults to stream=true when omitted
+    try:
+        payload = json.loads(body.decode("utf-8"))
+        return payload.get("stream", True) is not False
+    except Exception:
+        return True  # unparseable body — assume streaming
+
+
+async def _queue_worker() -> None:
+    """Background worker: dequeue non-streaming requests and forward to Ollama one at a time."""
+    while True:
+        _, _, _, item = await state.queue.get()
+        future: asyncio.Future = item["future"]
+        request_id: str = item["request_id"]
+
+        async with state.lock:
+            state.pending.pop(request_id, None)
+            state.active += 1
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(state.upstream_timeout, connect=30.0)
+            ) as client:
+                upstream = await client.request(
+                    method=item["method"],
+                    url=item["target_url"],
+                    params=item["query_params"],
+                    headers=item["headers"],
+                    content=item["body"],
+                )
+            if not future.done():
+                future.set_result(upstream)
+        except Exception as exc:
+            if not future.done():
+                future.set_exception(exc)
+        finally:
+            async with state.lock:
+                state.active -= 1
+            state.queue.task_done()
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    worker_tasks = [asyncio.create_task(_queue_worker()) for _ in range(state.workers)]
+    yield
+    for task in worker_tasks:
+        task.cancel()
+    await asyncio.gather(*worker_tasks, return_exceptions=True)
+
+
+app = FastAPI(title="SharedOllama Proxy", lifespan=lifespan)
+
+
 @app.get("/monitor/api/state")
 async def monitor_state(request: Request) -> Any:
     auth_error = await ensure_monitor_auth(request, state.monitor_token)
@@ -213,40 +304,6 @@ async def update_client_state(request: Request, client_key: str) -> Any:
     return {"client": updated, "cancelled_queued": 0}
 
 
-def _extract_requested_model(path: str, request_body: bytes) -> str:
-    """Read model name from known Ollama endpoints."""
-    if path not in {"/api/generate", "/api/chat", "/api/embeddings", "/api/embed", "/api/show"}:
-        return ""
-    if not request_body:
-        return ""
-
-    try:
-        payload = json.loads(request_body.decode("utf-8"))
-    except Exception:
-        return ""
-
-    if not isinstance(payload, dict):
-        return ""
-
-    # Some endpoints use "model", while /api/show typically uses "name".
-    model = payload.get("model") or payload.get("name")
-    return str(model).strip() if model is not None else ""
-
-
-def _is_self_backend(target_url: str, request: Request) -> bool:
-    """Detect backend configuration that points to this proxy instance."""
-    try:
-        parsed = urlparse(target_url)
-        backend_host = (parsed.hostname or "").lower()
-        backend_port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        request_port = request.url.port or (443 if request.url.scheme == "https" else 80)
-    except Exception:
-        return False
-
-    local_hosts = {"127.0.0.1", "localhost", "0.0.0.0", "::1"}
-    return backend_host in local_hosts and backend_port == request_port
-
-
 @app.get("/health")
 async def health() -> dict:
     """Health check endpoint."""
@@ -306,14 +363,12 @@ async def proxy(full_path: str, request: Request) -> Response:
             media_type="application/json",
         )
 
-    # Extract headers, excluding ones that should be regenerated
     filtered_headers = {
         key: value
         for key, value in request.headers.items()
         if key.lower() not in {"host", "content-length"}
     }
 
-    # Get request body
     request_body = await request.body()
 
     request_id = str(uuid.uuid4())
@@ -335,18 +390,56 @@ async def proxy(full_path: str, request: Request) -> Response:
                 media_type="application/json",
             )
 
+    # Streaming requests go directly to avoid holding up the queue.
+    # Non-streaming requests are queued for serialised, priority-ordered delivery.
+    if _is_stream_request(path, request_body):
+        return await _forward_direct(
+            request_id=request_id,
+            method=request.method,
+            target_url=target_url,
+            query_params=request.query_params,
+            headers=filtered_headers,
+            body=request_body,
+            path=path,
+            client_info=client_info,
+            started=started,
+        )
+    else:
+        return await _forward_queued(
+            request_id=request_id,
+            method=request.method,
+            target_url=target_url,
+            query_params=request.query_params,
+            headers=filtered_headers,
+            body=request_body,
+            path=path,
+            client_info=client_info,
+            started=started,
+        )
+
+
+async def _forward_direct(
+    request_id: str,
+    method: str,
+    target_url: str,
+    query_params: Any,
+    headers: dict[str, str],
+    body: bytes,
+    path: str,
+    client_info: dict[str, str],
+    started: float,
+) -> Response:
+    """Forward a streaming request directly to Ollama, bypassing the queue."""
     try:
-        # Forward request to backend
         async with httpx.AsyncClient(timeout=httpx.Timeout(state.upstream_timeout, connect=30.0)) as client:
             upstream_response = await client.request(
-                method=request.method,
+                method=method,
                 url=target_url,
-                params=request.query_params,
-                headers=filtered_headers,
-                content=request_body,
+                params=query_params,
+                headers=headers,
+                content=body,
             )
 
-        # Prepare response
         response_headers = {
             key: value
             for key, value in upstream_response.headers.items()
@@ -355,12 +448,12 @@ async def proxy(full_path: str, request: Request) -> Response:
 
         await _record_request_outcome(
             request_id=request_id,
-            method=request.method.upper(),
+            method=method.upper(),
             path=path,
             client_info=client_info,
             status_code=upstream_response.status_code,
             duration_ms=(time.time() - started) * 1000,
-            request_body=request_body,
+            request_body=body,
             response_body=upstream_response.content,
         )
         async with state.lock:
@@ -379,12 +472,12 @@ async def proxy(full_path: str, request: Request) -> Response:
             state.failed_total += 1
         await _record_request_outcome(
             request_id=request_id,
-            method=request.method.upper(),
+            method=method.upper(),
             path=path,
             client_info=client_info,
             status_code=502,
             duration_ms=(time.time() - started) * 1000,
-            request_body=request_body,
+            request_body=body,
             response_body=b"",
             error_text=str(exc),
         )
@@ -394,6 +487,134 @@ async def proxy(full_path: str, request: Request) -> Response:
             status_code=502,
             media_type="application/json",
         )
+
+
+async def _forward_queued(
+    request_id: str,
+    method: str,
+    target_url: str,
+    query_params: Any,
+    headers: dict[str, str],
+    body: bytes,
+    path: str,
+    client_info: dict[str, str],
+    started: float,
+) -> Response:
+    """Enqueue a non-streaming request and wait for a worker to process it."""
+    priority = await state.get_client_priority(client_info["client_key"])
+    enqueue_time = time.time()
+    future: asyncio.Future[httpx.Response] = asyncio.get_event_loop().create_future()
+
+    async with state.lock:
+        state.queue_sequence += 1
+        seq = state.queue_sequence
+
+    body_preview = body.decode("utf-8", errors="ignore")[:200].replace("\n", " ")
+
+    async with state.lock:
+        state.pending[request_id] = QueueItemInfo(
+            request_id=request_id,
+            method=method.upper(),
+            path=path,
+            enqueue_time=enqueue_time,
+            body_preview=body_preview,
+            request_details=body_preview,
+            request_model=_extract_requested_model(path, body),
+            request_prompt=body_preview,
+            client_key=client_info["client_key"],
+            client_label=client_info["client_label"],
+            client_ip=client_info["client_ip"],
+            client_ip_source=client_info["client_ip_source"],
+            client_kind=client_info["client_kind"],
+            client_details=client_info["client_details"],
+            client_priority=priority,
+        )
+
+    try:
+        state.queue.put_nowait((priority, enqueue_time, seq, {
+            "future": future,
+            "request_id": request_id,
+            "method": method,
+            "target_url": target_url,
+            "query_params": query_params,
+            "headers": headers,
+            "body": body,
+        }))
+    except asyncio.QueueFull:
+        async with state.lock:
+            state.pending.pop(request_id, None)
+        await state.add_log("WARN", "Queue full, request rejected", path=path, client_key=client_info["client_key"])
+        return JSONResponse({"error": "queue full, try again later"}, status_code=503)
+
+    await state.add_log("INFO", "Request queued", request_id=request_id, priority=priority, path=path)
+    await state.record_metric_snapshot()
+
+    try:
+        upstream_response = await asyncio.wait_for(asyncio.shield(future), timeout=state.upstream_timeout)
+    except asyncio.TimeoutError:
+        future.cancel()
+        async with state.lock:
+            state.pending.pop(request_id, None)
+        await _record_request_outcome(
+            request_id=request_id,
+            method=method.upper(),
+            path=path,
+            client_info=client_info,
+            status_code=504,
+            duration_ms=(time.time() - started) * 1000,
+            request_body=body,
+            response_body=b"",
+            error_text="queue timeout",
+        )
+        await state.record_metric_snapshot()
+        return JSONResponse({"error": "queue timeout"}, status_code=504)
+    except Exception as exc:
+        async with state.lock:
+            state.failed_total += 1
+        await _record_request_outcome(
+            request_id=request_id,
+            method=method.upper(),
+            path=path,
+            client_info=client_info,
+            status_code=502,
+            duration_ms=(time.time() - started) * 1000,
+            request_body=body,
+            response_body=b"",
+            error_text=str(exc),
+        )
+        await state.record_metric_snapshot()
+        return Response(
+            content=json.dumps({"error": f"Proxy error: {str(exc)}"}),
+            status_code=502,
+            media_type="application/json",
+        )
+
+    response_headers = {
+        key: value
+        for key, value in upstream_response.headers.items()
+        if key.lower() not in {"content-encoding", "transfer-encoding", "connection", "content-length"}
+    }
+
+    await _record_request_outcome(
+        request_id=request_id,
+        method=method.upper(),
+        path=path,
+        client_info=client_info,
+        status_code=upstream_response.status_code,
+        duration_ms=(time.time() - started) * 1000,
+        request_body=body,
+        response_body=upstream_response.content,
+    )
+    async with state.lock:
+        state.processed_total += 1
+    await state.record_metric_snapshot()
+
+    return Response(
+        content=upstream_response.content,
+        status_code=upstream_response.status_code,
+        headers=response_headers,
+        media_type=upstream_response.headers.get("content-type"),
+    )
 
 
 if __name__ == "__main__":
