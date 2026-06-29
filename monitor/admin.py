@@ -27,27 +27,27 @@ state = MonitorState()
 
 
 async def _proxy_monitor_request(path: str, method: str = "GET", payload: dict | None = None) -> Response:
-  runtime = await state.runtime_config_snapshot()
-  proxy_port = parse_port(runtime.get("shared_port", 11434), 11434)
-  url = f"http://127.0.0.1:{proxy_port}{path}"
-  headers: dict[str, str] = {}
-  if state.monitor_token:
-    headers["x-monitor-token"] = state.monitor_token
+    runtime = await state.runtime_config_snapshot()
+    proxy_port = parse_port(runtime.get("shared_port", 11434), 11434)
+    url = f"http://127.0.0.1:{proxy_port}{path}"
+    headers: dict[str, str] = {}
+    if state.monitor_token:
+        headers["x-monitor-token"] = state.monitor_token
 
-  try:
-    async with httpx.AsyncClient(timeout=6.0) as client:
-      response = await client.request(method=method, url=url, headers=headers, json=payload)
-  except Exception as exc:
-    return JSONResponse({"error": f"proxy monitor unavailable: {exc}"}, status_code=502)
-
-  content_type = response.headers.get("content-type", "")
-  if "application/json" in content_type.lower():
     try:
-      return JSONResponse(response.json(), status_code=response.status_code)
-    except Exception:
-      return JSONResponse({"error": "invalid proxy monitor response"}, status_code=502)
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            response = await client.request(method=method, url=url, headers=headers, json=payload)
+    except Exception as exc:
+        return JSONResponse({"error": f"proxy monitor unavailable: {exc}"}, status_code=502)
 
-  return JSONResponse({"error": "unexpected proxy monitor response"}, status_code=502)
+    content_type = response.headers.get("content-type", "")
+    if "application/json" in content_type.lower():
+        try:
+            return JSONResponse(response.json(), status_code=response.status_code)
+        except Exception:
+            return JSONResponse({"error": "invalid proxy monitor response"}, status_code=502)
+
+    return JSONResponse({"error": "unexpected proxy monitor response"}, status_code=502)
 
 
 @asynccontextmanager
@@ -419,86 +419,96 @@ async def monitor_state(request: Request):
 
 @app.get("/monitor/api/admin/state")
 async def admin_state(request: Request):
-  auth_error = await ensure_monitor_auth(request, state.monitor_token)
-  if auth_error:
-    return auth_error
+    auth_error = await ensure_monitor_auth(request, state.monitor_token)
+    if auth_error:
+        return auth_error
 
-  runtime = await state.runtime_config_snapshot()
-  backend = await check_backend_version(runtime.get("backend_url", state.backend_url))
-  client_port = parse_port(runtime.get("shared_port", 11434), 11434)
-  client_endpoint = {
-    "url": f"http://127.0.0.1:{client_port}",
-    "host": "127.0.0.1",
-    "port": client_port,
-    "note": "Client applications should connect to this endpoint.",
-  }
-  ollama_status = await run_ollama_control(
-    action="status",
-    host=str(runtime.get("ollama_host", DEFAULT_OLLAMA_HOST)),
-    port=parse_port(runtime.get("ollama_port", DEFAULT_OLLAMA_PORT), DEFAULT_OLLAMA_PORT),
-  )
+    runtime = await state.runtime_config_snapshot()
+    backend = await check_backend_version(runtime.get("backend_url", state.backend_url))
+    client_port = parse_port(runtime.get("shared_port", 11434), 11434)
+    client_endpoint = {
+        "url": f"http://127.0.0.1:{client_port}",
+        "host": "127.0.0.1",
+        "port": client_port,
+        "note": "Client applications should connect to this endpoint.",
+    }
+    ollama_status = await run_ollama_control(
+        action="status",
+        host=str(runtime.get("ollama_host", DEFAULT_OLLAMA_HOST)),
+        port=parse_port(runtime.get("ollama_port", DEFAULT_OLLAMA_PORT), DEFAULT_OLLAMA_PORT),
+    )
 
-  return {
-    "runtime_config": runtime,
-    "client_endpoint": client_endpoint,
-    "backend": backend,
-    "ollama": ollama_status,
-  }
+    return {
+        "runtime_config": runtime,
+        "client_endpoint": client_endpoint,
+        "backend": backend,
+        "ollama": ollama_status,
+    }
 
 
 @app.post("/monitor/api/admin/config")
 async def admin_update_config(request: Request):
-  auth_error = await ensure_monitor_auth(request, state.monitor_token)
-  if auth_error:
-    return auth_error
+    auth_error = await ensure_monitor_auth(request, state.monitor_token)
+    if auth_error:
+        return auth_error
 
-  payload = await request.json()
-  host = str(payload.get("ollama_host", DEFAULT_OLLAMA_HOST)).strip()
-  port = parse_port(payload.get("ollama_port", DEFAULT_OLLAMA_PORT), DEFAULT_OLLAMA_PORT)
-  backend_url = str(payload.get("backend_url", "")).strip().rstrip("/") or f"http://{host}:{port}"
+    payload = await request.json()
+    host = str(payload.get("ollama_host", DEFAULT_OLLAMA_HOST)).strip()
+    port = parse_port(payload.get("ollama_port", DEFAULT_OLLAMA_PORT), DEFAULT_OLLAMA_PORT)
+    backend_url = str(payload.get("backend_url", "")).strip().rstrip("/") or f"http://{host}:{port}"
 
-  saved = await state.update_runtime_config(
-    backend_url=backend_url,
-    shared_port=11434,
-    ollama_host=host,
-    ollama_port=port,
-  )
-  await state.mark_admin_action("config_saved", backend_url=backend_url)
-  return {"ok": True, "config": saved}
+    saved = await state.update_runtime_config(
+        backend_url=backend_url,
+        shared_port=11434,
+        ollama_host=host,
+        ollama_port=port,
+    )
+    await state.mark_admin_action("config_saved", backend_url=backend_url)
+
+    # Propagate live to the running proxy — ignore if proxy is unreachable
+    await _proxy_monitor_request(
+        path="/monitor/api/admin/config",
+        method="POST",
+        payload={"backend_url": backend_url, "ollama_host": host, "ollama_port": port},
+    )
+
+    return {"ok": True, "config": saved}
 
 
 @app.post("/monitor/api/admin/refresh-models")
 async def admin_refresh_models(request: Request):
-  auth_error = await ensure_monitor_auth(request, state.monitor_token)
-  if auth_error:
-    return auth_error
-  await state.refresh_models()
-  return {"ok": True, "count": len(state.models_cache)}
+    auth_error = await ensure_monitor_auth(request, state.monitor_token)
+    if auth_error:
+        return auth_error
+    await state.refresh_models()
+    # Also refresh the proxy's model cache so the dashboard shows current models
+    await _proxy_monitor_request("/monitor/api/admin/refresh-models", "POST")
+    return {"ok": True, "count": len(state.models_cache)}
 
 
 @app.post("/monitor/api/admin/ollama/{action}")
 async def admin_ollama_action(request: Request, action: str):
-  auth_error = await ensure_monitor_auth(request, state.monitor_token)
-  if auth_error:
-    return auth_error
+    auth_error = await ensure_monitor_auth(request, state.monitor_token)
+    if auth_error:
+        return auth_error
 
-  normalized_action = action.strip().lower()
-  if normalized_action not in {"start", "stop", "restart", "status"}:
-    return JSONResponse({"error": "invalid action"}, status_code=400)
+    normalized_action = action.strip().lower()
+    if normalized_action not in {"start", "stop", "restart", "status"}:
+        return JSONResponse({"error": "invalid action"}, status_code=400)
 
-  runtime = await state.runtime_config_snapshot()
-  result = await run_ollama_control(
-    action=normalized_action,
-    host=str(runtime.get("ollama_host", DEFAULT_OLLAMA_HOST)),
-    port=parse_port(runtime.get("ollama_port", DEFAULT_OLLAMA_PORT), DEFAULT_OLLAMA_PORT),
-  )
-  await state.mark_admin_action(
-    f"ollama_{normalized_action}",
-    ok=result.get("ok", False),
-    exit_code=result.get("exit_code"),
-  )
-  status_code = 200 if result.get("ok") else 500
-  return JSONResponse({"ok": bool(result.get("ok")), "action": normalized_action, "result": result}, status_code=status_code)
+    runtime = await state.runtime_config_snapshot()
+    result = await run_ollama_control(
+        action=normalized_action,
+        host=str(runtime.get("ollama_host", DEFAULT_OLLAMA_HOST)),
+        port=parse_port(runtime.get("ollama_port", DEFAULT_OLLAMA_PORT), DEFAULT_OLLAMA_PORT),
+    )
+    await state.mark_admin_action(
+        f"ollama_{normalized_action}",
+        ok=result.get("ok", False),
+        exit_code=result.get("exit_code"),
+    )
+    status_code = 200 if result.get("ok") else 500
+    return JSONResponse({"ok": bool(result.get("ok")), "action": normalized_action, "result": result}, status_code=status_code)
 
 
 @app.get("/monitor/api/clients")

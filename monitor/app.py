@@ -11,9 +11,9 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from .shared import MonitorState, QueueItemInfo, ensure_monitor_auth, now_iso
+from .shared import MonitorState, QueueItemInfo, ensure_monitor_auth, now_iso, parse_priority_value
 
 state = MonitorState()
 
@@ -95,6 +95,7 @@ def _build_client_info(request: Request) -> dict[str, str]:
         "client_ip_source": "forwarded-header" if headers.get("x-forwarded-for") else "socket-peer",
         "client_kind": client_kind,
         "client_details": f"ua={user_agent[:120]} | host={headers.get('host', '')}",
+        "client_priority_header": headers.get("x-client-priority", ""),
     }
 
 
@@ -151,15 +152,12 @@ def _extract_requested_model(path: str, request_body: bytes) -> str:
         return ""
     if not request_body:
         return ""
-
     try:
         payload = json.loads(request_body.decode("utf-8"))
     except Exception:
         return ""
-
     if not isinstance(payload, dict):
         return ""
-
     # Some endpoints use "model", while /api/show typically uses "name".
     model = payload.get("model") or payload.get("name")
     return str(model).strip() if model is not None else ""
@@ -174,7 +172,6 @@ def _is_self_backend(target_url: str, request: Request) -> bool:
         request_port = request.url.port or (443 if request.url.scheme == "https" else 80)
     except Exception:
         return False
-
     local_hosts = {"127.0.0.1", "localhost", "0.0.0.0", "::1"}
     return backend_host in local_hosts and backend_port == request_port
 
@@ -290,18 +287,42 @@ async def update_client_state(request: Request, client_key: str) -> Any:
     action = str(payload.get("action", "")).strip().lower()
     if action not in {"pause", "block", "resume"}:
         return JSONResponse({"error": "invalid action"}, status_code=400)
-
     if action == "resume":
         updated = await state.set_client_state(client_key, "active")
         await state.add_log("INFO", "Client resumed", client_key=client_key)
         await state.record_metric_snapshot()
         return {"client": updated, "cancelled_queued": 0}
-
     next_state = "paused" if action == "pause" else "blocked"
     updated = await state.set_client_state(client_key, next_state)
     await state.add_log("WARN", "Client state changed", client_key=client_key, state=next_state)
     await state.record_metric_snapshot()
     return {"client": updated, "cancelled_queued": 0}
+
+
+@app.post("/monitor/api/admin/config")
+async def admin_config(request: Request) -> Any:
+    """Receive a live config update from the admin process."""
+    auth_error = await ensure_monitor_auth(request, state.monitor_token)
+    if auth_error:
+        return auth_error
+    payload = await request.json()
+    saved = await state.update_runtime_config(
+        backend_url=str(payload.get("backend_url", "")).strip(),
+        shared_port=11434,
+        ollama_host=str(payload.get("ollama_host", "")).strip(),
+        ollama_port=payload.get("ollama_port", 11435),
+    )
+    return {"ok": True, "config": saved}
+
+
+@app.post("/monitor/api/admin/refresh-models")
+async def admin_refresh_models(request: Request) -> Any:
+    """Refresh the proxy's model cache from the Ollama backend."""
+    auth_error = await ensure_monitor_auth(request, state.monitor_token)
+    if auth_error:
+        return auth_error
+    await state.refresh_models()
+    return {"ok": True, "count": len(state.models_cache)}
 
 
 @app.get("/health")
@@ -353,12 +374,10 @@ async def proxy(full_path: str, request: Request) -> Response:
 
     if _is_self_backend(target_url, request):
         return Response(
-            content=json.dumps(
-                {
-                    "error": "Invalid backend_url: points to proxy itself. Update backend in admin panel.",
-                    "backend_url": state.backend_url,
-                }
-            ),
+            content=json.dumps({
+                "error": "Invalid backend_url: points to proxy itself. Update backend in admin panel.",
+                "backend_url": state.backend_url,
+            }),
             status_code=500,
             media_type="application/json",
         )
@@ -381,7 +400,6 @@ async def proxy(full_path: str, request: Request) -> Response:
                 status_code=403,
                 media_type="application/json",
             )
-
         model_ready = await state.ensure_model_available(resolved_model, request_id=request_id)
         if not model_ready:
             return Response(
@@ -390,8 +408,6 @@ async def proxy(full_path: str, request: Request) -> Response:
                 media_type="application/json",
             )
 
-    # Streaming requests go directly to avoid holding up the queue.
-    # Non-streaming requests are queued for serialised, priority-ordered delivery.
     if _is_stream_request(path, request_body):
         return await _forward_direct(
             request_id=request_id,
@@ -429,42 +445,52 @@ async def _forward_direct(
     client_info: dict[str, str],
     started: float,
 ) -> Response:
-    """Forward a streaming request directly to Ollama, bypassing the queue."""
+    """Forward a streaming request to Ollama with true HTTP streaming (no buffering)."""
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(state.upstream_timeout, connect=30.0)) as client:
-            upstream_response = await client.request(
-                method=method,
-                url=target_url,
-                params=query_params,
-                headers=headers,
-                content=body,
-            )
+        client = httpx.AsyncClient(timeout=httpx.Timeout(state.upstream_timeout, connect=30.0))
+        req = client.build_request(
+            method=method,
+            url=target_url,
+            params=query_params,
+            headers=headers,
+            content=body,
+        )
+        upstream = await client.send(req, stream=True)
 
         response_headers = {
             key: value
-            for key, value in upstream_response.headers.items()
+            for key, value in upstream.headers.items()
             if key.lower() not in {"content-encoding", "transfer-encoding", "connection", "content-length"}
         }
 
+        # Record at first-byte time; response body not available for streams
         await _record_request_outcome(
             request_id=request_id,
             method=method.upper(),
             path=path,
             client_info=client_info,
-            status_code=upstream_response.status_code,
+            status_code=upstream.status_code,
             duration_ms=(time.time() - started) * 1000,
             request_body=body,
-            response_body=upstream_response.content,
+            response_body=b"",
         )
         async with state.lock:
             state.processed_total += 1
         await state.record_metric_snapshot()
 
-        return Response(
-            content=upstream_response.content,
-            status_code=upstream_response.status_code,
+        async def generate():
+            try:
+                async for chunk in upstream.aiter_bytes():
+                    yield chunk
+            finally:
+                await upstream.aclose()
+                await client.aclose()
+
+        return StreamingResponse(
+            generate(),
+            status_code=upstream.status_code,
             headers=response_headers,
-            media_type=upstream_response.headers.get("content-type"),
+            media_type=upstream.headers.get("content-type"),
         )
 
     except Exception as exc:
@@ -501,7 +527,12 @@ async def _forward_queued(
     started: float,
 ) -> Response:
     """Enqueue a non-streaming request and wait for a worker to process it."""
+    # x-client-priority header overrides the stored client priority for this request
     priority = await state.get_client_priority(client_info["client_key"])
+    header_priority = parse_priority_value(client_info.get("client_priority_header", ""))
+    if header_priority is not None:
+        priority = header_priority
+
     enqueue_time = time.time()
     future: asyncio.Future[httpx.Response] = asyncio.get_event_loop().create_future()
 
