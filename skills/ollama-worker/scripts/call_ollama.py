@@ -152,10 +152,6 @@ def main() -> None:
         user_message = sys.stdin.read().strip()
     else:
         user_message = args.user
-        if not sys.stdin.isatty():
-            stdin_content = sys.stdin.read().strip()
-            if stdin_content:
-                user_message = f"{stdin_content}\n\n{user_message}"
 
     result = call_ollama(
         model=model,
