@@ -179,6 +179,53 @@ Current status for older builds (for example `22621.525`):
 - Expect monitor to show internal relay IPs (for example `172.18.x.x`) instead of true LAN source IP.
 - Use `x-client-name` (or `x-client-id`) to identify remote clients reliably until Windows is updated.
 
+## Claude Code Skill (optional)
+
+SharedOllama ships a Claude Code skill that lets Claude delegate bounded coding tasks
+to a local Ollama model (Qwen Coder), saving cloud tokens for architecture and reasoning.
+
+Invoke with `/ollama-worker <task>` in any Claude Code session.
+
+The skill routes requests with `stream: false` and `x-client-priority: 0` through the
+SharedOllama proxy, giving code assistance the highest queue priority over other clients.
+
+### Install
+
+```powershell
+.\scripts\install_skill.ps1
+```
+
+This copies `skills/ollama-worker/` into `~/.claude/skills/` and makes `/ollama-worker`
+available in all Claude Code sessions across all projects.
+
+### Uninstall
+
+```powershell
+.\scripts\install_skill.ps1 -Uninstall
+```
+
+### Disable without uninstalling
+
+Set the environment variable `DISABLE_OLLAMA_WORKER=1`.
+Claude Code will skip suggesting the skill when this variable is present.
+
+```powershell
+# Current session only
+$env:DISABLE_OLLAMA_WORKER = "1"
+
+# Permanent (user profile)
+[System.Environment]::SetEnvironmentVariable("DISABLE_OLLAMA_WORKER", "1", "User")
+```
+
+### Recommended local models
+
+Install at least one of these in Ollama for best results:
+
+```bash
+ollama pull qwen2.5-coder:7b   # recommended
+ollama pull qwen2.5-coder:1.5b # lighter alternative
+```
+
 ## Troubleshooting
 
 - WSL control log: `~/.sharedollama/ollama.log`
