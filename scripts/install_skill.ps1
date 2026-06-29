@@ -74,7 +74,11 @@ if ((Test-Path $ClaudeDir) -and -not $Force) {
 
 # --- Install ---
 Write-Step "Installing $SkillName skill to $ClaudeDir ..."
-Copy-Item -Recurse -Force $SourceDir $ClaudeDir
+New-Item -ItemType Directory -Force $ClaudeDir | Out-Null
+# Copy contents, not the folder itself, to avoid nested ollama-worker/ollama-worker
+Get-ChildItem -Path $SourceDir | ForEach-Object {
+    Copy-Item -Recurse -Force $_.FullName $ClaudeDir
+}
 Write-Ok "Skill installed."
 
 # --- Disable hint ---

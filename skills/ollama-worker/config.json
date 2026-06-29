@@ -13,7 +13,7 @@
       "note": "Solid quality — needs ~6GB VRAM"
     },
     {
-      "name": "qwen2.5-coder:1.5b",
+      "name": "qwen2.5-coder:1.5b-base",
       "context_tokens": 8000,
       "note": "Lightweight — runs on CPU or 2GB VRAM"
     },

@@ -218,7 +218,7 @@ class MonitorState:
         )
         self.rate_limit_per_minute = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
         self.max_queue_size = int(os.getenv("MAX_QUEUE_SIZE", "200"))
-        self.workers = int(os.getenv("QUEUE_WORKERS", "2"))
+        self.workers = int(os.getenv("QUEUE_WORKERS", "1"))  # 1 enforces strict priority ordering
         self.max_log_entries = int(os.getenv("MAX_LOG_ENTRIES", "500"))
         self.max_error_entries = int(os.getenv("MAX_ERROR_ENTRIES", "200"))
         self.max_alert_entries = int(os.getenv("MAX_ALERT_ENTRIES", "200"))

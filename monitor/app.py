@@ -176,8 +176,16 @@ def _is_self_backend(target_url: str, request: Request) -> bool:
     return backend_host in local_hosts and backend_port == request_port
 
 
+_INFERENCE_PATHS = {"/api/generate", "/api/chat", "/api/embeddings", "/api/embed"}
+
+
+def _is_inference_path(path: str) -> bool:
+    """Return True for paths that require GPU inference and must go through the priority queue."""
+    return path in _INFERENCE_PATHS
+
+
 def _is_stream_request(path: str, body: bytes) -> bool:
-    """Return True if this is a streaming Ollama request (the default for generate/chat)."""
+    """Return True if the client requested a streaming response (stream:true or omitted)."""
     if path not in {"/api/generate", "/api/chat"}:
         return False
     if not body:
@@ -189,33 +197,78 @@ def _is_stream_request(path: str, body: bytes) -> bool:
         return True  # unparseable body — assume streaming
 
 
+async def _worker_handle_buffered(item: dict) -> None:
+    """Worker branch: non-streaming — forward to Ollama, resolve future with full response."""
+    future: asyncio.Future = item["future"]
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(state.upstream_timeout, connect=30.0)
+        ) as client:
+            upstream = await client.request(
+                method=item["method"],
+                url=item["target_url"],
+                params=item["query_params"],
+                headers=item["headers"],
+                content=item["body"],
+            )
+        if not future.done():
+            future.set_result(upstream)
+    except Exception as exc:
+        if not future.done():
+            future.set_exception(exc)
+
+
+async def _worker_handle_stream(item: dict) -> None:
+    """Worker branch: streaming — open Ollama stream, resolve headers_future, feed chunk_queue."""
+    headers_future: asyncio.Future = item["headers_future"]
+    chunk_queue: asyncio.Queue = item["chunk_queue"]
+    try:
+        client = httpx.AsyncClient(timeout=httpx.Timeout(state.upstream_timeout, connect=30.0))
+        req = client.build_request(
+            method=item["method"],
+            url=item["target_url"],
+            params=item["query_params"],
+            headers=item["headers"],
+            content=item["body"],
+        )
+        upstream = await client.send(req, stream=True)
+        if not headers_future.done():
+            headers_future.set_result((upstream.status_code, dict(upstream.headers)))
+        async for chunk in upstream.aiter_bytes():
+            await chunk_queue.put(chunk)
+        await upstream.aclose()
+        await client.aclose()
+    except Exception as exc:
+        if not headers_future.done():
+            headers_future.set_exception(exc)
+        else:
+            await chunk_queue.put(exc)
+    finally:
+        await chunk_queue.put(None)  # sentinel: stream complete
+
+
 async def _queue_worker() -> None:
-    """Background worker: dequeue non-streaming requests and forward to Ollama one at a time."""
+    """Background worker: dequeue ALL inference requests in priority order, one at a time.
+
+    A single worker ensures strict priority ordering — Ollama is serial anyway,
+    so multiple workers would only race to acquire the GPU without improving throughput.
+    Streaming and non-streaming requests are both queued here so that a high-priority
+    skill call can be served before a low-priority streaming client's next request.
+    """
     while True:
         _, _, _, item = await state.queue.get()
-        future: asyncio.Future = item["future"]
         request_id: str = item["request_id"]
+        is_stream: bool = item.get("is_stream", False)
 
         async with state.lock:
             state.pending.pop(request_id, None)
             state.active += 1
 
         try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(state.upstream_timeout, connect=30.0)
-            ) as client:
-                upstream = await client.request(
-                    method=item["method"],
-                    url=item["target_url"],
-                    params=item["query_params"],
-                    headers=item["headers"],
-                    content=item["body"],
-                )
-            if not future.done():
-                future.set_result(upstream)
-        except Exception as exc:
-            if not future.done():
-                future.set_exception(exc)
+            if is_stream:
+                await _worker_handle_stream(item)
+            else:
+                await _worker_handle_buffered(item)
         finally:
             async with state.lock:
                 state.active -= 1
@@ -408,8 +461,11 @@ async def proxy(full_path: str, request: Request) -> Response:
                 media_type="application/json",
             )
 
-    if _is_stream_request(path, request_body):
-        return await _forward_direct(
+    if _is_inference_path(path):
+        # ALL inference requests (streaming or not) go through the priority queue so that
+        # high-priority callers (e.g. ollama-worker-skill at priority 0) are served before
+        # low-priority streaming clients at priority 100, even across request types.
+        return await _forward_queued(
             request_id=request_id,
             method=request.method,
             target_url=target_url,
@@ -419,9 +475,11 @@ async def proxy(full_path: str, request: Request) -> Response:
             path=path,
             client_info=client_info,
             started=started,
+            is_stream=_is_stream_request(path, request_body),
         )
     else:
-        return await _forward_queued(
+        # Lightweight paths (tags, ps, show, pull, …) bypass the queue.
+        return await _forward_direct(
             request_id=request_id,
             method=request.method,
             target_url=target_url,
@@ -525,24 +583,48 @@ async def _forward_queued(
     path: str,
     client_info: dict[str, str],
     started: float,
+    is_stream: bool = False,
 ) -> Response:
-    """Enqueue a non-streaming request and wait for a worker to process it."""
-    # x-client-priority header overrides the stored client priority for this request
+    """Enqueue an inference request (streaming or buffered) in priority order."""
     priority = await state.get_client_priority(client_info["client_key"])
     header_priority = parse_priority_value(client_info.get("client_priority_header", ""))
     if header_priority is not None:
         priority = header_priority
 
     enqueue_time = time.time()
-    future: asyncio.Future[httpx.Response] = asyncio.get_event_loop().create_future()
+    body_preview = body.decode("utf-8", errors="ignore")[:200].replace("\n", " ")
+
+    # Build the queue payload based on response type
+    if is_stream:
+        headers_future: asyncio.Future = asyncio.get_event_loop().create_future()
+        chunk_queue: asyncio.Queue = asyncio.Queue()
+        payload = {
+            "is_stream": True,
+            "headers_future": headers_future,
+            "chunk_queue": chunk_queue,
+            "request_id": request_id,
+            "method": method,
+            "target_url": target_url,
+            "query_params": query_params,
+            "headers": headers,
+            "body": body,
+        }
+    else:
+        future: asyncio.Future[httpx.Response] = asyncio.get_event_loop().create_future()
+        payload = {
+            "is_stream": False,
+            "future": future,
+            "request_id": request_id,
+            "method": method,
+            "target_url": target_url,
+            "query_params": query_params,
+            "headers": headers,
+            "body": body,
+        }
 
     async with state.lock:
         state.queue_sequence += 1
         seq = state.queue_sequence
-
-    body_preview = body.decode("utf-8", errors="ignore")[:200].replace("\n", " ")
-
-    async with state.lock:
         state.pending[request_id] = QueueItemInfo(
             request_id=request_id,
             method=method.upper(),
@@ -562,24 +644,76 @@ async def _forward_queued(
         )
 
     try:
-        state.queue.put_nowait((priority, enqueue_time, seq, {
-            "future": future,
-            "request_id": request_id,
-            "method": method,
-            "target_url": target_url,
-            "query_params": query_params,
-            "headers": headers,
-            "body": body,
-        }))
+        state.queue.put_nowait((priority, enqueue_time, seq, payload))
     except asyncio.QueueFull:
         async with state.lock:
             state.pending.pop(request_id, None)
         await state.add_log("WARN", "Queue full, request rejected", path=path, client_key=client_info["client_key"])
         return JSONResponse({"error": "queue full, try again later"}, status_code=503)
 
-    await state.add_log("INFO", "Request queued", request_id=request_id, priority=priority, path=path)
+    await state.add_log("INFO", "Request queued", request_id=request_id, priority=priority,
+                        path=path, stream=is_stream)
     await state.record_metric_snapshot()
 
+    # --- Streaming path ---
+    if is_stream:
+        try:
+            status_code, upstream_headers = await asyncio.wait_for(
+                asyncio.shield(headers_future), timeout=state.upstream_timeout
+            )
+        except asyncio.TimeoutError:
+            headers_future.cancel()
+            async with state.lock:
+                state.pending.pop(request_id, None)
+            await _record_request_outcome(
+                request_id=request_id, method=method.upper(), path=path, client_info=client_info,
+                status_code=504, duration_ms=(time.time() - started) * 1000,
+                request_body=body, response_body=b"", error_text="queue timeout",
+            )
+            await state.record_metric_snapshot()
+            return JSONResponse({"error": "queue timeout"}, status_code=504)
+        except Exception as exc:
+            async with state.lock:
+                state.failed_total += 1
+            await _record_request_outcome(
+                request_id=request_id, method=method.upper(), path=path, client_info=client_info,
+                status_code=502, duration_ms=(time.time() - started) * 1000,
+                request_body=body, response_body=b"", error_text=str(exc),
+            )
+            await state.record_metric_snapshot()
+            return Response(
+                content=json.dumps({"error": f"Proxy error: {str(exc)}"}),
+                status_code=502, media_type="application/json",
+            )
+
+        response_headers = {
+            k: v for k, v in upstream_headers.items()
+            if k.lower() not in {"content-encoding", "transfer-encoding", "connection", "content-length"}
+        }
+        await _record_request_outcome(
+            request_id=request_id, method=method.upper(), path=path, client_info=client_info,
+            status_code=status_code, duration_ms=(time.time() - started) * 1000,
+            request_body=body, response_body=b"",
+        )
+        async with state.lock:
+            state.processed_total += 1
+        await state.record_metric_snapshot()
+
+        async def generate():
+            while True:
+                chunk = await chunk_queue.get()
+                if chunk is None or isinstance(chunk, Exception):
+                    break
+                yield chunk
+
+        return StreamingResponse(
+            generate(),
+            status_code=status_code,
+            headers=response_headers,
+            media_type=upstream_headers.get("content-type"),
+        )
+
+    # --- Buffered path ---
     try:
         upstream_response = await asyncio.wait_for(asyncio.shield(future), timeout=state.upstream_timeout)
     except asyncio.TimeoutError:
@@ -587,15 +721,9 @@ async def _forward_queued(
         async with state.lock:
             state.pending.pop(request_id, None)
         await _record_request_outcome(
-            request_id=request_id,
-            method=method.upper(),
-            path=path,
-            client_info=client_info,
-            status_code=504,
-            duration_ms=(time.time() - started) * 1000,
-            request_body=body,
-            response_body=b"",
-            error_text="queue timeout",
+            request_id=request_id, method=method.upper(), path=path, client_info=client_info,
+            status_code=504, duration_ms=(time.time() - started) * 1000,
+            request_body=body, response_body=b"", error_text="queue timeout",
         )
         await state.record_metric_snapshot()
         return JSONResponse({"error": "queue timeout"}, status_code=504)
@@ -603,38 +731,25 @@ async def _forward_queued(
         async with state.lock:
             state.failed_total += 1
         await _record_request_outcome(
-            request_id=request_id,
-            method=method.upper(),
-            path=path,
-            client_info=client_info,
-            status_code=502,
-            duration_ms=(time.time() - started) * 1000,
-            request_body=body,
-            response_body=b"",
-            error_text=str(exc),
+            request_id=request_id, method=method.upper(), path=path, client_info=client_info,
+            status_code=502, duration_ms=(time.time() - started) * 1000,
+            request_body=body, response_body=b"", error_text=str(exc),
         )
         await state.record_metric_snapshot()
         return Response(
             content=json.dumps({"error": f"Proxy error: {str(exc)}"}),
-            status_code=502,
-            media_type="application/json",
+            status_code=502, media_type="application/json",
         )
 
     response_headers = {
-        key: value
-        for key, value in upstream_response.headers.items()
-        if key.lower() not in {"content-encoding", "transfer-encoding", "connection", "content-length"}
+        k: v for k, v in upstream_response.headers.items()
+        if k.lower() not in {"content-encoding", "transfer-encoding", "connection", "content-length"}
     }
-
     await _record_request_outcome(
-        request_id=request_id,
-        method=method.upper(),
-        path=path,
-        client_info=client_info,
+        request_id=request_id, method=method.upper(), path=path, client_info=client_info,
         status_code=upstream_response.status_code,
         duration_ms=(time.time() - started) * 1000,
-        request_body=body,
-        response_body=upstream_response.content,
+        request_body=body, response_body=upstream_response.content,
     )
     async with state.lock:
         state.processed_total += 1
