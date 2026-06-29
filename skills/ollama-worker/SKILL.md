@@ -9,6 +9,32 @@ Delegate small, well-defined coding tasks to the local Ollama model (Qwen Coder)
 
 ---
 
+## Task sizing — Claude decides before delegating
+
+Before calling Qwen, estimate whether the task fits the selected model's context window.
+The right model changes what's feasible:
+
+| Model | Context | Suitable task size |
+|-------|---------|-------------------|
+| `qwen2.5-coder:1.5b` | ~8K tokens | Single function, < 100 lines of context |
+| `qwen2.5-coder:7b` | ~32K tokens | Single file, up to ~500 lines of context |
+| `qwen3-coder` (any) | 32K–128K tokens | Larger files, multi-function rewrites |
+
+**Rule:** If the task + required context exceeds ~60% of the model's context window, split
+it into sub-tasks and delegate one at a time. Never truncate context silently — a partial
+view produces wrong output.
+
+**Qwen can produce whole files** — use `WRITE_FILE` for new files or complete rewrites.
+For targeted edits, prefer `REPLACE_EXACT` or `REPLACE_LINES` to keep output small.
+
+Splitting heuristic:
+- Single method/function → one call
+- Whole file rewrite (< model limit) → one call with `WRITE_FILE`
+- Multiple unrelated changes in one file → split into one call per change
+- Changes across multiple files → one call per file, in dependency order
+
+---
+
 ## When to use
 
 Qualified tasks — bounded, single concern:
@@ -28,7 +54,6 @@ Do NOT use for:
 - Architecture decisions
 - Security analysis
 - Compliance or legal review
-- Large refactors across many files
 - Unclear or ambiguous requirements
 
 If the task does not qualify, say so and handle it directly without delegating.
@@ -37,7 +62,7 @@ If the task does not qualify, say so and handle it directly without delegating.
 
 ## Workflow
 
-### Step 1 — Check model availability
+### Step 1 — Check model availability and select
 
 ```bash
 curl -s http://localhost:11434/api/tags
@@ -45,11 +70,13 @@ curl -s http://localhost:11434/api/tags
 
 Select model in this order of preference:
 
-1. `qwen3-coder` (any variant)
-2. `qwen2.5-coder` (any variant)
-3. `qwen2.5` (any variant)
-4. Any available model as fallback
+1. `qwen3-coder` (any variant) — largest context, best quality
+2. `qwen2.5-coder:7b` — good quality, 32K context
+3. `qwen2.5-coder:1.5b` — lightweight, small tasks only
+4. `qwen2.5` (any variant) — fallback
+5. Any available model
 
+Adjust model choice based on task size (see Task sizing above).
 If Ollama is unreachable or no model is available, return `LOCAL_MODEL_UNAVAILABLE` and stop.
 Do NOT fall back to cloud automatically — Claude decides whether to retry or escalate.
 
@@ -57,54 +84,51 @@ Do NOT fall back to cloud automatically — Claude decides whether to retry or e
 
 Use Read, Grep, or Glob tools. Read the minimum needed:
 
-- Prefer targeted line ranges over whole-file reads
+- For targeted edits: read only the relevant lines/function
+- For whole-file rewrites: read the full file (only if it fits the model)
 - Use Grep to locate relevant functions or symbols
-- Read at most 2–3 files, only relevant sections
-
-Never read the entire project or unrelated files.
+- Never read unrelated files
 
 ### Step 3 — Call Ollama
 
-Use the helper script:
+**For pure generation tasks** (new function, new file, explain code):
 
 ```powershell
 python "$env:USERPROFILE\.claude\skills\ollama-worker\scripts\call_ollama.py" `
   --model <selected-model> `
-  --system "<concise system prompt>" `
-  --user "<task description + only the relevant context>"
+  --system "You are a focused coding assistant. Return only the requested code." `
+  --user "<task + minimal context>"
 ```
 
-Or inline with Python if the context needs building dynamically:
+**For file modification tasks** (edit, replace, inject, whole-file rewrite) — use the
+file-op system prompt so Qwen returns a structured FILE_OP block that `apply_op.py`
+can execute autonomously:
 
-```python
-import urllib.request, json
-
-payload = json.dumps({
-    "model": "<selected>",
-    "stream": False,
-    "messages": [
-        {"role": "system", "content": "<system prompt>"},
-        {"role": "user",   "content": "<task + context>"}
-    ]
-}).encode()
-
-req = urllib.request.Request(
-    "http://localhost:11434/api/chat",
-    data=payload,
-    headers={"Content-Type": "application/json", "x-client-priority": "0"},
-)
-with urllib.request.urlopen(req, timeout=120) as r:
-    content = json.loads(r.read())["message"]["content"]
+```powershell
+python "$env:USERPROFILE\.claude\skills\ollama-worker\scripts\call_ollama.py" `
+  --model <selected-model> `
+  --system (Get-Content "$env:USERPROFILE\.claude\skills\ollama-worker\prompts\file_op_system.txt" -Raw) `
+  --user "<task>\n\nFILE: <path>\n<relevant content>"
 ```
 
-**Always:**
+Always use:
+- `"stream": false` — routes through SharedOllama priority queue
+- `"x-client-priority": "0"` — highest priority; code assistance served first
 
-- `"stream": false` — routes through the SharedOllama priority queue (non-blocking for other clients)
-- `"x-client-priority": "0"` — highest priority; code assistance is served before other queued work
+### Step 4 — Apply file operations
 
-### Step 4 — Apply changes
+```powershell
+# Pipe directly (apply immediately)
+python "$env:USERPROFILE\.claude\skills\ollama-worker\scripts\call_ollama.py" ... |
+  python "$env:USERPROFILE\.claude\skills\ollama-worker\scripts\apply_op.py"
 
-Parse the model response for code blocks. Apply changes with the Edit tool — targeted edits only. Never overwrite whole files. If the change is large or uncertain, generate a diff description first and confirm before applying.
+# Dry-run first when confidence is uncertain
+python "$env:USERPROFILE\.claude\skills\ollama-worker\scripts\call_ollama.py" ... |
+  python "$env:USERPROFILE\.claude\skills\ollama-worker\scripts\apply_op.py" --dry-run
+```
+
+`apply_op.py` exits 0 on success, 1 on parse error, 2 on apply error, and always prints
+a JSON result. Stop and report to Claude on any non-zero exit.
 
 ### Step 5 — Run tests
 
@@ -112,44 +136,143 @@ If the project has a known test command, run it and note the result.
 
 ### Step 6 — Return structured result
 
-Always end with this JSON block:
+Always end with:
 
 ```json
 {
   "summary": "One sentence describing what was done",
   "files_changed": ["relative/path/to/file.py"],
-  "diff": "Short description or unified diff of the change",
+  "diff": "apply_op.py JSON result or short description",
   "tests": { "executed": true, "passed": true },
   "warnings": [],
   "confidence": 0.92
 }
 ```
 
-If `confidence` is below 0.70, flag it explicitly and ask Claude to review before applying any patch.
+If `confidence` is below 0.70, flag it and ask Claude to review before applying.
+
+---
+
+## FILE_OP format reference
+
+Qwen uses this format when asked to modify or create files.
+
+### REPLACE_EXACT — replace a unique string in a file
+
+```
+FILE_OP REPLACE_EXACT
+FILE: path/to/file.py
+<<<OLD
+exact old text (must be unique in the file)
+OLD>>>
+<<<NEW
+replacement text
+NEW>>>
+END_OP
+```
+
+### REPLACE_LINES — replace a line range (1-indexed, inclusive)
+
+```
+FILE_OP REPLACE_LINES
+FILE: path/to/file.py
+FROM: 42
+TO: 55
+<<<NEW
+new content for those lines
+NEW>>>
+END_OP
+```
+
+### INSERT_AFTER — insert code after a unique anchor
+
+```
+FILE_OP INSERT_AFTER
+FILE: path/to/file.py
+<<<AFTER
+the exact anchor line or text
+AFTER>>>
+<<<NEW
+code to insert after the anchor
+NEW>>>
+END_OP
+```
+
+### WRITE_FILE — write a new file or complete rewrite
+
+```
+FILE_OP WRITE_FILE
+FILE: path/to/file.py
+<<<CONTENT
+full file content here
+CONTENT>>>
+END_OP
+```
+
+---
+
+## Precise task phrasing guide
+
+| Intent | Phrase to use |
+|--------|--------------|
+| Replace a function body | "Replace the function `foo` with this implementation" |
+| Replace lines 200–250 | "Replace lines 200 to 250 in file X with Y" |
+| Add a method to a class | "Insert after the line `class Foo:` the following method" |
+| Add import at top | "Insert after the last existing import line" |
+| Refactor a method | "In file X, where `def bar(` is, replace the whole method with" |
+| Create a new file | "Write a new file at path X with content Y" |
+| Full file rewrite | "Rewrite the entire file X to do Y (current content below)" |
+| Remove dead code | "Replace lines 30 to 45 with nothing (delete them)" |
+
+---
+
+## Full autonomous example
+
+Task: "Add a `__repr__` method to the `QueueItemInfo` dataclass in `monitor/shared.py`"
+
+```powershell
+$task = @"
+Add a __repr__ method to the QueueItemInfo dataclass.
+Return: QueueItem(<first 8 chars of request_id> <method> <path> pri=<client_priority>)
+
+FILE: monitor/shared.py
+<<<CONTEXT
+@dataclass
+class QueueItemInfo:
+    request_id: str
+    method: str
+    path: str
+    enqueue_time: float
+    body_preview: str
+    request_details: str
+    request_model: str
+    request_prompt: str
+    client_key: str
+    client_label: str
+    client_ip: str
+    client_ip_source: str
+    client_kind: str
+    client_details: str
+    client_priority: int
+CONTEXT>>>
+"@
+
+python "$env:USERPROFILE\.claude\skills\ollama-worker\scripts\call_ollama.py" `
+  --model qwen2.5-coder:7b `
+  --system (Get-Content "$env:USERPROFILE\.claude\skills\ollama-worker\prompts\file_op_system.txt" -Raw) `
+  --user $task |
+  python "$env:USERPROFILE\.claude\skills\ollama-worker\scripts\apply_op.py"
+```
 
 ---
 
 ## Safety rules
 
 - Never commit, push, or merge
-- Never delete files
-- Never overwrite a file without a targeted Edit
-- Never expose secrets or credentials in prompts sent to Ollama
-- If the local model fails or returns garbage: return `LOCAL_MODEL_UNAVAILABLE`, stop, let Claude decide next step
-
----
-
-## Token optimisation
-
-Return only what Claude needs to review:
-
-- `summary`
-- `diff` (not the full file)
-- `tests` result
-- `warnings`
-
-Never return full file contents unless the user explicitly asks for it.
-Claude reviews the summary and diff only. Full context is requested only when confidence is low.
+- Never delete files (use REPLACE_LINES with empty NEW to remove lines)
+- `apply_op.py` refuses if old text / anchor is ambiguous (multiple matches)
+- Run `--dry-run` when confidence < 0.85 or task is large
+- If the local model fails or returns no FILE_OP: return `LOCAL_MODEL_UNAVAILABLE`, stop
 
 ---
 
@@ -157,6 +280,7 @@ Claude reviews the summary and diff only. Full context is requested only when co
 
 | Role | Responsibility |
 |------|----------------|
-| Claude | Architect, reviewer, decision maker |
-| Ollama / Qwen | Implementation worker for bounded tasks |
+| Claude | Architect, estimates task size, reads context, reviews result |
+| Ollama / Qwen | Generates FILE_OP blocks and implementation code |
+| apply_op.py | Executes FILE_OP blocks autonomously, reports JSON |
 | OpenRouter | Overflow — only when Claude decides to escalate |
