@@ -21,26 +21,37 @@ function Write-Log {
 
 Write-Log "SharedOllama startup triggered"
 
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$resolvedRepoRoot = (Resolve-Path $repoRoot).Path
+$drive = $resolvedRepoRoot.Substring(0, 1).ToLowerInvariant()
+$tail = $resolvedRepoRoot.Substring(2).Replace("\", "/")
+$wslRepoPath = "/mnt/$drive$tail"
+
 # --- Run a single WSL session that waits for systemd, starts services if needed, and returns the WSL IP.
 # Combining everything into one bash call avoids multiple WSL restarts between invocations. ---
 Write-Log "Initializing WSL and services"
-$wslScript = @'
+$wslScript = @"
 # Wait for systemd user session to be available (max 60s)
-for i in $(seq 1 20); do
+for i in `$(seq 1 20); do
     systemctl --user is-system-running >/dev/null 2>&1 && break
     sleep 3
 done
 
+# Start Ollama before proxy/admin so the proxy has a live backend after logon.
+if [ -x "$wslRepoPath/scripts/wsl_ollama_control.sh" ]; then
+    "$wslRepoPath/scripts/wsl_ollama_control.sh" start --host 127.0.0.1 --port 11435 >/dev/null 2>&1 || true
+fi
+
 # Start services only if not already active (avoid interrupting running services)
 for svc in sharedollama-proxy.service sharedollama-admin.service; do
-    if ! systemctl --user is-active --quiet "$svc"; then
-        systemctl --user start "$svc" 2>/dev/null || true
+    if ! systemctl --user is-active --quiet "`$svc"; then
+        systemctl --user start "`$svc" 2>/dev/null || true
     fi
 done
 
 # Return WSL IP
-hostname -I | awk '{print $1}'
-'@
+hostname -I | awk '{print `$1}'
+"@
 
 $wslOutput = ""
 if ([string]::IsNullOrWhiteSpace($Distro)) {

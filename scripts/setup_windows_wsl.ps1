@@ -196,6 +196,9 @@ else {
     }
     Invoke-Wsl -Command "cd '$wslRepoPath' && chmod +x scripts/install_wsl.sh scripts/wsl_ollama_control.sh && ./scripts/install_wsl.sh $installFlags"
 
+    Write-Log "Starting Ollama backend in WSL"
+    Invoke-Wsl -Command "cd '$wslRepoPath' && scripts/wsl_ollama_control.sh start --host 127.0.0.1 --port 11435 >/dev/null"
+
     Write-Log "Restarting SharedOllama proxy/admin services in WSL"
     Invoke-Wsl -Command "systemctl --user daemon-reload >/dev/null 2>&1 || true"
     Invoke-Wsl -Command "systemctl --user enable --now sharedollama-proxy.service >/dev/null 2>&1 || true"

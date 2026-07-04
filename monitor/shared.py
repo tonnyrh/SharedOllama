@@ -228,6 +228,12 @@ class MonitorState:
         self.model_pull_timeout = float(os.getenv("MODEL_PULL_TIMEOUT_SECONDS", "900"))
         self.model_pull_retry_count = int(os.getenv("MODEL_PULL_RETRY_COUNT", "1"))
         self.model_refresh_interval_seconds = int(os.getenv("MODEL_REFRESH_INTERVAL_SECONDS", "60"))
+        self.backend_health_cache_seconds = float(os.getenv("BACKEND_HEALTH_CACHE_SECONDS", "30"))
+        self.backend_autostart_enabled = os.getenv("BACKEND_AUTOSTART_ENABLED", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+        }
         self.monitor_token = os.getenv("MONITOR_TOKEN", "")
 
         allowlist_raw = os.getenv("MODEL_ALLOWLIST", "*").strip()
@@ -272,6 +278,8 @@ class MonitorState:
         self.model_pull_locks: dict[str, asyncio.Lock] = {}
         self.last_admin_action: str = ""
         self.last_admin_action_at: str | None = None
+        self.backend_ready_until = 0.0
+        self.backend_start_lock = asyncio.Lock()
 
         self.lock = asyncio.Lock()
 
@@ -571,6 +579,64 @@ class MonitorState:
             await self.add_log("INFO", "Models refreshed", count=len(self.models_cache))
         except Exception as exc:
             await self.add_log("ERROR", "Failed refreshing models", error=str(exc))
+
+    def backend_is_configured_ollama(self) -> bool:
+        try:
+            parsed = urlparse(self.backend_url)
+            backend_host = (parsed.hostname or "").lower()
+            backend_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        except Exception:
+            return False
+        configured_host = self.ollama_host.lower()
+        local_hosts = {"127.0.0.1", "localhost", "0.0.0.0", "::1"}
+        return backend_host in local_hosts and configured_host in local_hosts and backend_port == self.ollama_port
+
+    async def ensure_backend_ready(self) -> tuple[bool, str]:
+        now = time.time()
+        if now < self.backend_ready_until:
+            return True, "backend health cached"
+
+        async with self.backend_start_lock:
+            now = time.time()
+            if now < self.backend_ready_until:
+                return True, "backend health cached"
+
+            check = await check_backend_version(self.backend_url)
+            if check.get("ok"):
+                self.backend_ready_until = time.time() + self.backend_health_cache_seconds
+                return True, "backend reachable"
+
+            if not self.backend_autostart_enabled:
+                message = f"Backend unavailable and autostart disabled: {check.get('body', '')}"
+                await self.add_alert(message, backend_url=self.backend_url)
+                return False, message
+
+            if not self.backend_is_configured_ollama():
+                message = f"Backend unavailable and not a local configured Ollama target: {self.backend_url}"
+                await self.add_alert(message, backend_url=self.backend_url)
+                return False, message
+
+            await self.add_log("WARN", "Backend unavailable, attempting Ollama start", backend_url=self.backend_url)
+            start_result = await run_ollama_control("start", self.ollama_host, self.ollama_port)
+            if not start_result.get("ok"):
+                message = (
+                    "Backend unavailable and Ollama start failed: "
+                    f"{clip_text(start_result.get('stderr') or start_result.get('stdout') or start_result)}"
+                )
+                await self.add_alert(message, backend_url=self.backend_url)
+                return False, message
+
+            for _ in range(20):
+                await asyncio.sleep(0.5)
+                check = await check_backend_version(self.backend_url)
+                if check.get("ok"):
+                    self.backend_ready_until = time.time() + self.backend_health_cache_seconds
+                    await self.add_log("INFO", "Backend reachable after Ollama start", backend_url=self.backend_url)
+                    return True, "backend started"
+
+            message = "Ollama start command succeeded, but backend did not become reachable"
+            await self.add_alert(message, backend_url=self.backend_url)
+            return False, message
 
     def resolve_model_name(self, requested_model: str) -> str:
         model = requested_model.strip()

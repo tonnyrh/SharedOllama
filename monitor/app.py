@@ -444,6 +444,24 @@ async def proxy(full_path: str, request: Request) -> Response:
     request_body = await request.body()
 
     request_id = str(uuid.uuid4())
+    backend_ready, backend_message = await state.ensure_backend_ready()
+    if not backend_ready:
+        async with state.lock:
+            state.failed_total += 1
+        await _record_request_outcome(
+            request_id=request_id,
+            method=request.method.upper(),
+            path=path,
+            client_info=client_info,
+            status_code=503,
+            duration_ms=(time.time() - started) * 1000,
+            request_body=request_body,
+            response_body=b"",
+            error_text=backend_message,
+        )
+        await state.record_metric_snapshot()
+        return JSONResponse({"error": backend_message}, status_code=503)
+
     requested_model = _extract_requested_model(path, request_body)
     if requested_model:
         resolved_model = state.resolve_model_name(requested_model)

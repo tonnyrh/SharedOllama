@@ -16,6 +16,7 @@ $RuntimeConfigPath  = Join-Path $RepoRoot "monitor\runtime_config.json"
 $ControlScriptPath  = Join-Path $RepoRoot "scripts\ollama_control_windows.ps1"
 $ProxyTaskName  = "SharedOllamaProxy"
 $AdminTaskName  = "SharedOllamaAdmin"
+$OllamaTaskName = "SharedOllamaBackend"
 $OllamaPort     = 11435   # Ollama backend; proxy exposes 11434 to clients
 $SetupLog       = "C:\ProgramData\SharedOllama\setup.log"
 
@@ -45,6 +46,7 @@ if ($Uninstall) {
     Write-Log "Uninstalling SharedOllama Windows native services"
     Remove-Task $ProxyTaskName
     Remove-Task $AdminTaskName
+    Remove-Task $OllamaTaskName
     [System.Environment]::SetEnvironmentVariable("SHAREDOLLAMA_RUNTIME_CONFIG",       $null, "Machine")
     [System.Environment]::SetEnvironmentVariable("SHAREDOLLAMA_OLLAMA_CONTROL_SCRIPT", $null, "Machine")
     Write-Log "Services removed. Venv at $VenvDir was not deleted - remove manually if desired."
@@ -205,6 +207,25 @@ foreach ($svc in @(
     Write-Log "Registered: $($svc.Name)"
 }
 
+Write-Log "Registering scheduled task for Ollama backend"
+Remove-Task $OllamaTaskName
+$ollamaAction = New-ScheduledTaskAction `
+    -Execute "powershell.exe" `
+    -Argument "-NonInteractive -NoProfile -ExecutionPolicy Bypass -File `"$ControlScriptPath`" start -OllamaHost 127.0.0.1 -OllamaPort $OllamaPort"
+$ollamaTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$ollamaSettings = New-ScheduledTaskSettingsSet `
+    -StartWhenAvailable `
+    -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
+$ollamaPrincipal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
+Register-ScheduledTask `
+    -TaskName $OllamaTaskName `
+    -Action $ollamaAction `
+    -Trigger $ollamaTrigger `
+    -Settings $ollamaSettings `
+    -Principal $ollamaPrincipal `
+    -Description "Start SharedOllama Ollama backend on the configured internal port" | Out-Null
+Write-Log "Registered: $OllamaTaskName"
+
 # ── Firewall ──────────────────────────────────────────────────────────────────
 if ($SkipFirewall) {
     Write-Log "Skipping firewall setup"
@@ -223,6 +244,10 @@ else {
 }
 
 # ── Start tasks now (without waiting for reboot) ──────────────────────────────
+Write-Log "Starting Ollama backend now"
+$ollamaStartOutput = & powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File $ControlScriptPath start -OllamaHost 127.0.0.1 -OllamaPort $OllamaPort
+Write-Log "Ollama start result: $ollamaStartOutput"
+
 Write-Log "Starting services now"
 # Stop any existing Python processes so the new config is picked up cleanly
 Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -259,8 +284,8 @@ Write-Log ""
 Write-Log "Setup complete."
 Write-Log "  Proxy : http://localhost:11434  (clients connect here)"
 Write-Log "  Admin : http://localhost:11444/monitor"
-Write-Log "  Ollama: starts at user logon on port $OllamaPort (OLLAMA_HOST set in user environment)"
+Write-Log "  Ollama: started now and scheduled at user logon on port $OllamaPort"
 Write-Log ""
-Write-Log "Proxy and admin start at boot (SYSTEM, no logon needed). Ollama starts at logon."
+Write-Log "Proxy and admin start at boot (SYSTEM, no logon needed). Ollama starts now and at user logon."
 Write-Log "Input: Start the service"
 Write-Log "Output: Service started successfully."
