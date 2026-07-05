@@ -1,13 +1,19 @@
-# SharedOllama — Codex Agent Instructions
+# SharedOllama — Cursor Agent Instructions
 
 SharedOllama is a WSL-native HTTP proxy and admin monitor for Ollama.
 It provides a single stable endpoint with rate limiting, priority queueing,
 client controls, and a web admin UI.
 
-Cursor support:
+## Cursor support
+
 - Project rule: `.cursor/rules/agent-routing.mdc`
 - Cursor-discoverable skill wrapper: `.cursor/skills/ollama-worker/SKILL.md`
-- Canonical skill implementation remains in `skills/ollama-worker/`
+- Canonical skill implementation: `skills/ollama-worker/`
+- Personal install (all workspaces): `scripts/install_cursor_skill.ps1`
+- Verification: `python scripts/check_cursor.py`
+
+Open `C:\vscode\SharedOllama` in Cursor to use project-local routing, or run
+`install_cursor_skill.ps1` to make `ollama-worker` available in any workspace.
 
 ## Architecture
 

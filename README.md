@@ -220,7 +220,10 @@ Its job is to offload small, bounded edits to a local Ollama/Qwen model while ke
 
 ### Cursor support
 
-Cursor support is repository-local and intentionally isolated from the canonical skill:
+Cursor support is repository-local and intentionally isolated from the canonical skill.
+Cursor can use this repository directly without copying skills elsewhere.
+
+Repository-local Cursor files:
 
 - `.cursor/rules/agent-routing.mdc`
   Always-on Cursor project rule that prefers the local worker for bounded tasks.
@@ -234,6 +237,22 @@ This separation matters:
 - Edit `skills/ollama-worker/` when changing behavior.
 - Edit `.cursor/` only when changing Cursor discovery or routing behavior.
 - Edit `AGENTS.md` only for repository-level instructions.
+
+Quick verification:
+
+```powershell
+cd C:\vscode\SharedOllama
+python scripts\check_cursor.py
+python skills\ollama-worker\scripts\check_ollama.py
+```
+
+Install the worker globally for all Cursor workspaces:
+
+```powershell
+.\scripts\install_cursor_skill.ps1
+```
+
+This copies `skills/ollama-worker/` into `%USERPROFILE%\.cursor\skills\ollama-worker\`.
 
 ### Claude Code Skill (optional)
 
