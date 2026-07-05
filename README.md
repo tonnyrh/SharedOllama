@@ -3,6 +3,38 @@
 SharedOllama is a WSL-native proxy and monitor for Ollama.
 It gives you one stable endpoint for clients, plus queueing, rate limiting, client controls, and an admin UI.
 
+## Agent Configuration Boundaries
+
+This repository now contains three distinct agent-facing layers. Keep them separate:
+
+- `skills/ollama-worker/`
+  Source of truth for the local Ollama worker skill shared across coding agents.
+- `.cursor/`
+  Cursor-specific discovery layer. This contains Cursor rules and Cursor-discoverable skill wrappers only.
+- `AGENTS.md`
+  Repository-level agent instructions for tools that support `AGENTS.md`, including Cursor.
+
+Do not treat `.cursor/skills/ollama-worker/` as the canonical skill implementation.
+The canonical implementation remains in `skills/ollama-worker/`; the Cursor wrapper only points to it so Cursor can discover and route to the same underlying skill.
+
+Current layout:
+
+```text
+SharedOllama/
+  AGENTS.md
+  .cursor/
+    rules/
+      agent-routing.mdc
+    skills/
+      ollama-worker/
+        SKILL.md            <- Cursor wrapper only
+  skills/
+    ollama-worker/
+      SKILL.md              <- canonical skill
+      scripts/
+      prompts/
+```
+
 ## Architecture
 
 Traffic flow:
@@ -179,7 +211,31 @@ Current status for older builds (for example `22621.525`):
 - Expect monitor to show internal relay IPs (for example `172.18.x.x`) instead of true LAN source IP.
 - Use `x-client-name` (or `x-client-id`) to identify remote clients reliably until Windows is updated.
 
-## Claude Code Skill (optional)
+## Agent Tooling
+
+### Canonical local skill
+
+The canonical local worker skill lives in `skills/ollama-worker/`.
+Its job is to offload small, bounded edits to a local Ollama/Qwen model while keeping architecture, review, and final validation in the main coding agent.
+
+### Cursor support
+
+Cursor support is repository-local and intentionally isolated from the canonical skill:
+
+- `.cursor/rules/agent-routing.mdc`
+  Always-on Cursor project rule that prefers the local worker for bounded tasks.
+- `.cursor/skills/ollama-worker/SKILL.md`
+  Cursor-discoverable wrapper that tells Cursor to read and use `skills/ollama-worker/`.
+- `AGENTS.md`
+  Repository-level instructions that explain SharedOllama architecture and local-assist policy.
+
+This separation matters:
+
+- Edit `skills/ollama-worker/` when changing behavior.
+- Edit `.cursor/` only when changing Cursor discovery or routing behavior.
+- Edit `AGENTS.md` only for repository-level instructions.
+
+### Claude Code Skill (optional)
 
 SharedOllama ships a Claude Code skill that lets Claude delegate bounded coding tasks
 to a local Ollama model (Qwen Coder), saving cloud tokens for architecture and reasoning.

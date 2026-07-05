@@ -4,6 +4,11 @@ SharedOllama is a WSL-native HTTP proxy and admin monitor for Ollama.
 It provides a single stable endpoint with rate limiting, priority queueing,
 client controls, and a web admin UI.
 
+Cursor support:
+- Project rule: `.cursor/rules/agent-routing.mdc`
+- Cursor-discoverable skill wrapper: `.cursor/skills/ollama-worker/SKILL.md`
+- Canonical skill implementation remains in `skills/ollama-worker/`
+
 ## Architecture
 
 ```

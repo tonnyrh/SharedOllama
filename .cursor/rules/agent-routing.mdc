@@ -1,0 +1,13 @@
+---
+description: Route Cursor agent work in SharedOllama and prefer the local ollama-worker skill for small bounded coding tasks.
+alwaysApply: true
+---
+
+# SharedOllama Cursor Routing
+
+- Treat [AGENTS.md](../../AGENTS.md) as the repository-level architecture and workflow baseline.
+- Prefer the local `ollama-worker` skill for one-file changes, one function or method, focused tests, small scripts, regex, and documentation edits.
+- Load [skills/ollama-worker/SKILL.md](../../skills/ollama-worker/SKILL.md) before using the local worker workflow.
+- Use [skills/ollama-worker/scripts/call_ollama.py](../../skills/ollama-worker/scripts/call_ollama.py) and [skills/ollama-worker/scripts/apply_op.py](../../skills/ollama-worker/scripts/apply_op.py) for local model delegation and FILE_OP application.
+- Keep local delegation bounded and review the diff before accepting it.
+- Do not escalate to cloud reasoning for routine bounded edits when the local worker can handle the task.
