@@ -1,17 +1,17 @@
 ---
 name: ollama-worker
-description: Delegate small, bounded coding and editing work to a local Ollama/Qwen worker before using cloud models. Use for one-file changes, one function or method, targeted refactors, focused tests, small scripts, regex, documentation edits, and FILE_OP-based patch generation where the Cursor agent remains architect and reviewer. Do not use for architecture, multi-subsystem changes, ambiguous requirements, security-sensitive analysis, or tasks that exceed local context; escalate those to OpenRouter only after the agent decides the local worker is unsuitable.
+description: Delegate small, bounded coding and editing work to a local Ollama/Qwen worker before using cloud models. Use for one-file changes, one function or method, targeted refactors, focused tests, small scripts, regex, documentation edits, and FILE_OP-based patch generation where the primary agent remains architect and reviewer. Do not use for architecture, multi-subsystem changes, ambiguous requirements, security-sensitive analysis, or tasks that exceed local context; escalate those to OpenRouter only after the primary agent decides the local worker is unsuitable.
 ---
 
 # Local Ollama Worker
 
-Delegate small, well-defined coding tasks to the local Ollama model via SharedOllama. The Cursor agent remains architect, context selector, reviewer, and test runner. The local model handles implementation drafts and structured FILE_OP edits only.
+Delegate small, well-defined coding tasks to the local Ollama model via SharedOllama. The primary agent remains architect, context selector, reviewer, and test runner. The local model handles implementation drafts and structured FILE_OP edits only.
 
 Use this skill as the default offload path for simple implementation work. Use OpenRouter/GLM only when the work is too broad, too ambiguous, too risky, or too context-heavy for the local worker.
 
 ---
 
-## Task sizing — the Cursor agent decides before delegating
+## Task sizing — the primary agent decides before delegating
 
 Before calling Qwen, estimate whether the task fits the selected model's context window.
 The right model changes what's feasible:
@@ -84,7 +84,7 @@ Preferred model order:
 
 Adjust model choice based on task size (see Task sizing above).
 If Ollama is unreachable or no model is available, return `LOCAL_MODEL_UNAVAILABLE` and stop.
-The Cursor agent may then continue directly with normal local work or `openrouter-heavy-task-gate` when the task is heavy enough.
+The primary agent may then continue directly with normal local work or `openrouter-heavy-task-gate` when the task is heavy enough.
 
 ### Step 2 - Gather minimal context
 
@@ -133,11 +133,11 @@ python "$skill\scripts\apply_op.py" --root $repo $opFile
 ```
 
 `apply_op.py` exits 0 on success, 1 on parse error, 2 on apply error, and always prints
-a JSON result. Stop and review locally on any non-zero exit. Do not ask Ollama to repair blindly until the Cursor agent has inspected the failure.
+a JSON result. Stop and review locally on any non-zero exit. Do not ask Ollama to repair blindly until the primary agent has inspected the failure.
 
 ### Step 5 - Review and test
 
-Review the diff after applying operations. Keep, adjust, or discard by normal Cursor editing rules; the local worker does not own final correctness.
+Review the diff after applying operations. Keep, adjust, or discard by normal local editing rules; the local worker does not own final correctness.
 
 If the project has a known test command, run it and note the result.
 
@@ -293,7 +293,7 @@ python "$skill\scripts\apply_op.py" --root $repo $opFile
 
 | Role | Responsibility |
 |------|----------------|
-| Cursor agent | Architect, estimates task size, reads context, reviews result |
+| Primary agent | Architect, estimates task size, reads context, reviews result |
 | Ollama / Qwen | Generates FILE_OP blocks and implementation code |
 | apply_op.py | Executes FILE_OP blocks autonomously, reports JSON |
 | OpenRouter | Overflow for larger, riskier, or long-context work after the agent decides to escalate |
