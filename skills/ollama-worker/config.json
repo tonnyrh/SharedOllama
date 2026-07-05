@@ -3,14 +3,19 @@
 
   "models": [
     {
+      "name": "qwen3-coder",
+      "context_tokens": 128000,
+      "note": "Best local coding worker when installed"
+    },
+    {
       "name": "qwen3:8b",
       "context_tokens": 32000,
-      "note": "Best choice — needs ~6GB VRAM"
+      "note": "Good local general/code worker - needs ~6GB VRAM"
     },
     {
       "name": "qwen2.5-coder:7b",
       "context_tokens": 32000,
-      "note": "Solid quality — needs ~6GB VRAM"
+      "note": "Solid local coding worker - needs ~6GB VRAM"
     },
     {
       "name": "qwen2.5:7b",

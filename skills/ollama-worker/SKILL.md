@@ -1,15 +1,17 @@
 ---
 name: ollama-worker
-description: Delegate a bounded coding task to a local Ollama model (Qwen Coder). Claude acts as architect and reviewer; the local model handles implementation. Use for modifying one file, implementing one function, refactoring a method, generating tests, small scripts, regex, or documentation. Call with /ollama-worker <task description>.
+description: Delegate small, bounded coding and editing work to a local Ollama/Qwen worker before using cloud models. Use for one-file changes, one function or method, targeted refactors, focused tests, small scripts, regex, documentation edits, and FILE_OP-based patch generation where Codex remains architect and reviewer. Do not use for architecture, multi-subsystem changes, ambiguous requirements, security-sensitive analysis, or tasks that exceed local context; escalate those to OpenRouter only after Codex decides the local worker is unsuitable.
 ---
 
 # Local Ollama Worker
 
-Delegate small, well-defined coding tasks to the local Ollama model (Qwen Coder) via SharedOllama. Claude remains architect and reviewer. The local model handles implementation only.
+Delegate small, well-defined coding tasks to the local Ollama model via SharedOllama. Codex remains architect, context selector, reviewer, and test runner. The local model handles implementation drafts and structured FILE_OP edits only.
+
+Use this skill as the default offload path for simple implementation work. Use OpenRouter/GLM only when the work is too broad, too ambiguous, too risky, or too context-heavy for the local worker.
 
 ---
 
-## Task sizing — Claude decides before delegating
+## Task sizing - Codex decides before delegating
 
 Before calling Qwen, estimate whether the task fits the selected model's context window.
 The right model changes what's feasible:
@@ -24,7 +26,7 @@ The right model changes what's feasible:
 it into sub-tasks and delegate one at a time. Never truncate context silently — a partial
 view produces wrong output.
 
-**Qwen can produce whole files** — use `WRITE_FILE` for new files or complete rewrites.
+**Qwen can produce whole files** - use `WRITE_FILE` for new files or complete rewrites.
 For targeted edits, prefer `REPLACE_EXACT` or `REPLACE_LINES` to keep output small.
 
 Splitting heuristic:
@@ -55,32 +57,36 @@ Do NOT use for:
 - Security analysis
 - Compliance or legal review
 - Unclear or ambiguous requirements
+- Tasks where the needed context cannot fit with margin
 
-If the task does not qualify, say so and handle it directly without delegating.
+If the task does not qualify, handle it directly or use `openrouter-heavy-task-gate` for a larger second pass. Do not stop for user confirmation unless the route requires missing credentials, sensitive context, destructive operations, or unclear requirements.
 
 ---
 
 ## Workflow
 
-### Step 1 — Check model availability and select
+### Step 1 - Set the skill path and check model availability
 
-```bash
-curl -s http://localhost:11434/api/tags
+```powershell
+$skill = "C:\vscode\SharedOllama\skills\ollama-worker"
+python "$skill\scripts\call_ollama.py" --list
 ```
 
-Select model in this order of preference:
+`call_ollama.py` auto-selects the first installed model from `config.json` when `--model` is omitted. Override `--model` only when task size or quality requires it.
 
-1. `qwen3-coder` (any variant) — largest context, best quality
-2. `qwen2.5-coder:7b` — good quality, 32K context
-3. `qwen2.5-coder:1.5b` — lightweight, small tasks only
+Preferred model order:
+
+1. `qwen3-coder` or `qwen3` coder-capable variants - largest context, best quality
+2. `qwen2.5-coder:7b` - good quality, 32K context
+3. `qwen2.5-coder:1.5b` - lightweight, small tasks only
 4. `qwen2.5` (any variant) — fallback
 5. Any available model
 
 Adjust model choice based on task size (see Task sizing above).
 If Ollama is unreachable or no model is available, return `LOCAL_MODEL_UNAVAILABLE` and stop.
-Do NOT fall back to cloud automatically — Claude decides whether to retry or escalate.
+Codex may then continue directly with normal local work or `openrouter-heavy-task-gate` when the task is heavy enough.
 
-### Step 2 — Gather minimal context
+### Step 2 - Gather minimal context
 
 Use Read, Grep, or Glob tools. Read the minimum needed:
 
@@ -88,14 +94,15 @@ Use Read, Grep, or Glob tools. Read the minimum needed:
 - For whole-file rewrites: read the full file (only if it fits the model)
 - Use Grep to locate relevant functions or symbols
 - Never read unrelated files
+- Include exact file paths relative to the repository root whenever possible
+- State the desired operation explicitly: replace exact block, replace lines, insert after anchor, or write file
 
-### Step 3 — Call Ollama
+### Step 3 - Call Ollama
 
 **For pure generation tasks** (new function, new file, explain code):
 
 ```powershell
-python "$env:USERPROFILE\.claude\skills\ollama-worker\scripts\call_ollama.py" `
-  --model <selected-model> `
+python "$skill\scripts\call_ollama.py" `
   --system "You are a focused coding assistant. Return only the requested code." `
   --user "<task + minimal context>"
 ```
@@ -105,36 +112,36 @@ file-op system prompt so Qwen returns a structured FILE_OP block that `apply_op.
 can execute autonomously:
 
 ```powershell
-python "$env:USERPROFILE\.claude\skills\ollama-worker\scripts\call_ollama.py" `
-  --model <selected-model> `
-  --system (Get-Content "$env:USERPROFILE\.claude\skills\ollama-worker\prompts\file_op_system.txt" -Raw) `
+python "$skill\scripts\call_ollama.py" `
+  --system (Get-Content -LiteralPath "$skill\prompts\file_op_system.txt" -Raw) `
   --user "<task>\n\nFILE: <path>\n<relevant content>"
 ```
 
 Always use:
-- `"stream": false` — routes through SharedOllama priority queue
-- `"x-client-priority": "0"` — highest priority; code assistance served first
+- `"stream": false` - routes through SharedOllama priority queue
+- `"x-client-priority": "0"` - highest priority; code assistance served first
 
-### Step 4 — Apply file operations
+### Step 4 - Apply file operations
 
 ```powershell
-# Pipe directly (apply immediately)
-python "$env:USERPROFILE\.claude\skills\ollama-worker\scripts\call_ollama.py" ... |
-  python "$env:USERPROFILE\.claude\skills\ollama-worker\scripts\apply_op.py"
+$repo = (Resolve-Path -LiteralPath .).Path
+$opFile = Join-Path $env:TEMP "ollama-worker-file-op.txt"
 
-# Dry-run first when confidence is uncertain
-python "$env:USERPROFILE\.claude\skills\ollama-worker\scripts\call_ollama.py" ... |
-  python "$env:USERPROFILE\.claude\skills\ollama-worker\scripts\apply_op.py" --dry-run
+python "$skill\scripts\call_ollama.py" ... | Set-Content -LiteralPath $opFile -Encoding utf8
+python "$skill\scripts\apply_op.py" --root $repo --dry-run $opFile
+python "$skill\scripts\apply_op.py" --root $repo $opFile
 ```
 
 `apply_op.py` exits 0 on success, 1 on parse error, 2 on apply error, and always prints
-a JSON result. Stop and report to Claude on any non-zero exit.
+a JSON result. Stop and review locally on any non-zero exit. Do not ask Ollama to repair blindly until Codex has inspected the failure.
 
-### Step 5 — Run tests
+### Step 5 - Review and test
+
+Review the diff after applying operations. Keep, adjust, or discard by normal Codex editing rules; the local worker does not own final correctness.
 
 If the project has a known test command, run it and note the result.
 
-### Step 6 — Return structured result
+### Step 6 - Return structured result
 
 Always end with:
 
@@ -142,14 +149,14 @@ Always end with:
 {
   "summary": "One sentence describing what was done",
   "files_changed": ["relative/path/to/file.py"],
-  "diff": "apply_op.py JSON result or short description",
+  "apply_result": "apply_op.py JSON result or short description",
   "tests": { "executed": true, "passed": true },
   "warnings": [],
   "confidence": 0.92
 }
 ```
 
-If `confidence` is below 0.70, flag it and ask Claude to review before applying.
+If `confidence` is below 0.70, flag it and review before applying.
 
 ---
 
@@ -231,6 +238,10 @@ END_OP
 Task: "Add a `__repr__` method to the `QueueItemInfo` dataclass in `monitor/shared.py`"
 
 ```powershell
+$skill = "C:\vscode\SharedOllama\skills\ollama-worker"
+$repo = (Resolve-Path -LiteralPath .).Path
+$opFile = Join-Path $env:TEMP "ollama-worker-file-op.txt"
+
 $task = @"
 Add a __repr__ method to the QueueItemInfo dataclass.
 Return: QueueItem(<first 8 chars of request_id> <method> <path> pri=<client_priority>)
@@ -257,11 +268,12 @@ class QueueItemInfo:
 CONTEXT>>>
 "@
 
-python "$env:USERPROFILE\.claude\skills\ollama-worker\scripts\call_ollama.py" `
-  --model qwen2.5-coder:7b `
-  --system (Get-Content "$env:USERPROFILE\.claude\skills\ollama-worker\prompts\file_op_system.txt" -Raw) `
-  --user $task |
-  python "$env:USERPROFILE\.claude\skills\ollama-worker\scripts\apply_op.py"
+python "$skill\scripts\call_ollama.py" `
+  --system (Get-Content -LiteralPath "$skill\prompts\file_op_system.txt" -Raw) `
+  --user $task | Set-Content -LiteralPath $opFile -Encoding utf8
+
+python "$skill\scripts\apply_op.py" --root $repo --dry-run $opFile
+python "$skill\scripts\apply_op.py" --root $repo $opFile
 ```
 
 ---
@@ -270,6 +282,7 @@ python "$env:USERPROFILE\.claude\skills\ollama-worker\scripts\call_ollama.py" `
 
 - Never commit, push, or merge
 - Never delete files (use REPLACE_LINES with empty NEW to remove lines)
+- Always pass `--root` to `apply_op.py` so FILE_OP paths cannot escape the intended workspace
 - `apply_op.py` refuses if old text / anchor is ambiguous (multiple matches)
 - Run `--dry-run` when confidence < 0.85 or task is large
 - If the local model fails or returns no FILE_OP: return `LOCAL_MODEL_UNAVAILABLE`, stop
@@ -280,7 +293,7 @@ python "$env:USERPROFILE\.claude\skills\ollama-worker\scripts\call_ollama.py" `
 
 | Role | Responsibility |
 |------|----------------|
-| Claude | Architect, estimates task size, reads context, reviews result |
+| Codex | Architect, estimates task size, reads context, reviews result |
 | Ollama / Qwen | Generates FILE_OP blocks and implementation code |
 | apply_op.py | Executes FILE_OP blocks autonomously, reports JSON |
-| OpenRouter | Overflow — only when Claude decides to escalate |
+| OpenRouter | Overflow for larger, riskier, or long-context work after Codex decides to escalate |

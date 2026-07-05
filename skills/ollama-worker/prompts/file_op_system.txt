@@ -75,3 +75,7 @@ CRITICAL RULES:
 - Preserve the original indentation style (tabs or spaces) of the target file
 - Do not add comments explaining what you changed — the code speaks for itself
 - When multiple ops modify the same file: later ops must reference content as it exists AFTER earlier ops are applied, not the original content
+- Prefer REPLACE_EXACT for targeted edits when the user provided enough unique surrounding context
+- Prefer REPLACE_LINES only when the user supplied reliable line numbers from the current file
+- Use WRITE_FILE only for new files or complete rewrites explicitly requested by the user
+- Use relative file paths exactly as provided; never invent absolute paths or edit files outside the requested workspace

@@ -63,6 +63,7 @@ WRITE_FILE — write a new file (or overwrite an existing one):
 import json
 import re
 import sys
+import argparse
 from pathlib import Path
 
 
@@ -98,8 +99,18 @@ def _parse_ops(text: str) -> list[dict]:
     return ops
 
 
-def _replace_exact(op: dict, dry_run: bool) -> dict:
-    path = Path(op["file"])
+def _resolve_path(file_name: str, root: Path) -> Path:
+    raw = Path(file_name)
+    path = raw if raw.is_absolute() else root / raw
+    resolved = path.resolve()
+    root_resolved = root.resolve()
+    if resolved != root_resolved and root_resolved not in resolved.parents:
+        raise ValueError(f"Refusing path outside root: {file_name}")
+    return resolved
+
+
+def _replace_exact(op: dict, dry_run: bool, root: Path) -> dict:
+    path = _resolve_path(op["file"], root)
     if not path.exists():
         return {"ok": False, "error": f"File not found: {op['file']}"}
 
@@ -118,8 +129,8 @@ def _replace_exact(op: dict, dry_run: bool) -> dict:
     return {"ok": True, "file": op["file"], "op": "REPLACE_EXACT", "dry_run": dry_run}
 
 
-def _replace_lines(op: dict, dry_run: bool) -> dict:
-    path = Path(op["file"])
+def _replace_lines(op: dict, dry_run: bool, root: Path) -> dict:
+    path = _resolve_path(op["file"], root)
     if not path.exists():
         return {"ok": False, "error": f"File not found: {op['file']}"}
 
@@ -142,8 +153,8 @@ def _replace_lines(op: dict, dry_run: bool) -> dict:
             "from": op.get("from_line"), "to": op.get("to_line"), "dry_run": dry_run}
 
 
-def _insert_after(op: dict, dry_run: bool) -> dict:
-    path = Path(op["file"])
+def _insert_after(op: dict, dry_run: bool, root: Path) -> dict:
+    path = _resolve_path(op["file"], root)
     if not path.exists():
         return {"ok": False, "error": f"File not found: {op['file']}"}
 
@@ -164,8 +175,8 @@ def _insert_after(op: dict, dry_run: bool) -> dict:
     return {"ok": True, "file": op["file"], "op": "INSERT_AFTER", "dry_run": dry_run}
 
 
-def _write_file(op: dict, dry_run: bool) -> dict:
-    path = Path(op["file"])
+def _write_file(op: dict, dry_run: bool, root: Path) -> dict:
+    path = _resolve_path(op["file"], root)
     content = op.get("content", "")
     if not dry_run:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -182,10 +193,14 @@ _HANDLERS = {
 
 
 def main() -> None:
-    dry_run = "--dry-run" in sys.argv
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    parser = argparse.ArgumentParser(description="Apply FILE_OP blocks to files under a workspace root.")
+    parser.add_argument("response_file", nargs="?", help="FILE_OP response file. Reads stdin when omitted.")
+    parser.add_argument("--dry-run", action="store_true", help="Preview without writing files.")
+    parser.add_argument("--root", default=".", help="Workspace root that FILE_OP paths must stay inside.")
+    args = parser.parse_args()
 
-    text = Path(args[0]).read_text(encoding="utf-8") if args else sys.stdin.read()
+    text = Path(args.response_file).read_text(encoding="utf-8") if args.response_file else sys.stdin.read()
+    root = Path(args.root).resolve()
 
     ops = _parse_ops(text)
     if not ops:
@@ -199,7 +214,10 @@ def main() -> None:
         if handler is None:
             result = {"ok": False, "error": f"Unknown op type: {op.get('type')}"}
         else:
-            result = handler(op, dry_run)
+            try:
+                result = handler(op, args.dry_run, root)
+            except ValueError as exc:
+                result = {"ok": False, "error": str(exc)}
         results.append(result)
         if not result.get("ok"):
             all_ok = False

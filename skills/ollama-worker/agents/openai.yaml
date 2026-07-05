@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ollama Worker"
+  short_description: "Delegate small coding edits to local Ollama"
+  default_prompt: "Use $ollama-worker to offload a small, bounded coding edit to local Ollama and apply it with FILE_OP review."
