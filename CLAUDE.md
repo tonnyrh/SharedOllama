@@ -65,7 +65,8 @@ Install it to delegate bounded coding tasks to local Qwen Coder and save cloud t
 
 The skill routes requests with `stream: false` and `x-client-priority: 0` through the
 SharedOllama proxy, giving code assistance the highest queue priority.
-Invoke with: `/ollama-worker <task>`
+Invoke via the Skill tool (`Skill(skill="ollama-worker", args="<task>")`), or the user can
+trigger it directly with `/ollama-worker <task>`.
 
 To disable without uninstalling: set `DISABLE_OLLAMA_WORKER=1` in your environment.
 Claude Code will skip suggesting the skill when this variable is present.
